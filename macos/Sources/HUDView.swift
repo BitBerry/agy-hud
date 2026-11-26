@@ -64,18 +64,14 @@ struct HUDView: View {
                 Text(HUDFormatters.formatTokens(state.contextTokens))
                     .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
                     .foregroundStyle(.primary)
-                Text("/\(thresholdText)")
+                Text("/\(thresholdText)/")
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundStyle(.secondary)
+                Text("\(remainingPct)%")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(remainingColor)
             }
-            .help("当前 Context / 压缩阈值 \(thresholdText)")
-
-            pillDivider
-
-            Text("压剩 \(remainingPct)%")
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                .foregroundStyle(remainingColor)
-                .help("距压缩阈值 \(thresholdText) 剩余 \(HUDFormatters.formatTokens(remainingTokens)) (\(remainingPct)%)")
+            .help("当前 Context / 压缩阈值 \(thresholdText) / 剩余 \(HUDFormatters.formatTokens(remainingTokens)) (\(remainingPct)%)")
 
             pillDivider
 
