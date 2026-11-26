@@ -12,6 +12,7 @@ final class TranscriptMonitor {
         let cacheReadTokens: Int
         let outputTokens: Int
         let contentLength: Int
+        let hasToolCalls: Bool
         let observedDoneMs: Double?
     }
 
@@ -41,6 +42,8 @@ final class TranscriptMonitor {
     private var lastTitleFetchAt: Date = .distantPast
     private var cachedTitles: [String: String] = [:]
     private var annotationCache: [String: AnnotationEntry] = [:]
+    private var lastHandledViewTime: Double = 0
+    private var currentAutoViewedId: String = ""
 
     private var observedThresholds: [String: Int] = [:]
     private var hookTimingsByConv: [String: [HookTimingRecord]] = [:]
@@ -137,7 +140,7 @@ final class TranscriptMonitor {
         if !state.isVisible && generatingStartByConv.isEmpty {
             interval = 4.0
         } else {
-            interval = 0.5
+            interval = 0.35
         }
         pollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
@@ -249,17 +252,64 @@ final class TranscriptMonitor {
         }
     }
 
-    private func mostRecentlyViewedAnnotation() -> AnnotationEntry? {
-        var best: AnnotationEntry?
-        for entry in annotationCache.values {
-            guard let vt = entry.lastUserViewTime else { continue }
-            if let cur = best, let curVt = cur.lastUserViewTime {
-                if vt > curVt { best = entry }
-            } else {
-                best = entry
+    private func resolveMostRecentlyViewedConversation() -> (id: String, viewTime: Double)? {
+        guard let maxVt = annotationCache.values.compactMap(\.lastUserViewTime).max() else {
+            return nil
+        }
+
+        // Only re-evaluate when a strictly newer view timestamp arrives, or on initial startup.
+        if !currentAutoViewedId.isEmpty && maxVt <= lastHandledViewTime + 0.0005 {
+            if let existing = annotationCache[currentAutoViewedId], let vt = existing.lastUserViewTime {
+                return (currentAutoViewedId, vt)
             }
         }
-        return best
+
+        // Antigravity often writes the exact same `last_user_view_time` to both the conversation
+        // the user just left AND the conversation the user just entered. Collect all tied entries
+        // within 150ms of maxVt and exclude the currently active conversation to pick the destination.
+        let tied = annotationCache.values.filter { entry in
+            guard let vt = entry.lastUserViewTime else { return false }
+            return (maxVt - vt) <= 0.15
+        }
+        guard !tied.isEmpty else { return nil }
+
+        let chosen: AnnotationEntry
+        if tied.count == 1 {
+            chosen = tied[0]
+        } else {
+            let switchedCandidates = tied.filter { $0.conversationId != activeConversationId }
+            let pool = switchedCandidates.isEmpty ? tied : switchedCandidates
+            chosen = pool.sorted { lhs, rhs in
+                let lVt = lhs.lastUserViewTime ?? 0
+                let rVt = rhs.lastUserViewTime ?? 0
+                if abs(lVt - rVt) > 0.0005 {
+                    return lVt > rVt
+                }
+                if abs(lhs.mtime.timeIntervalSince(rhs.mtime)) > 0.001 {
+                    return lhs.mtime > rhs.mtime
+                }
+                let lMtime = transcriptMtime(for: lhs.conversationId)
+                let rMtime = transcriptMtime(for: rhs.conversationId)
+                if lMtime != rMtime {
+                    return lMtime > rMtime
+                }
+                return lhs.conversationId < rhs.conversationId
+            }.first!
+        }
+
+        lastHandledViewTime = maxVt
+        currentAutoViewedId = chosen.conversationId
+        return (chosen.conversationId, chosen.lastUserViewTime ?? maxVt)
+    }
+
+    private func transcriptMtime(for conversationId: String) -> TimeInterval {
+        let p = transcriptPath(for: conversationId)
+        guard !p.isEmpty,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: p),
+              let d = attrs[.modificationDate] as? Date else {
+            return 0
+        }
+        return d.timeIntervalSince1970
     }
 
     private static let viewTimeRegex = try! NSRegularExpression(
@@ -521,16 +571,16 @@ final class TranscriptMonitor {
         }
 
         // 2. Primary source: Antigravity's `annotations/<id>.pbtxt` `last_user_view_time`
-        if let viewed = mostRecentlyViewedAnnotation(), let viewedSec = viewed.lastUserViewTime {
+        if let viewed = resolveMostRecentlyViewedConversation() {
             // Only prefer a brand-new hook conversation if it has no annotation view time yet
             // AND started strictly after the last viewed conversation.
             if !hookActiveConvId.isEmpty,
-               hookActiveConvId != viewed.conversationId,
+               hookActiveConvId != viewed.id,
                annotationCache[hookActiveConvId]?.lastUserViewTime == nil,
-               hookLastEventAt.timeIntervalSince1970 > viewedSec {
+               hookLastEventAt.timeIntervalSince1970 > viewed.viewTime {
                 return (transcriptPath(for: hookActiveConvId), hookActiveConvId)
             }
-            return (transcriptPath(for: viewed.conversationId), viewed.conversationId)
+            return (transcriptPath(for: viewed.id), viewed.id)
         }
 
         // 3. Fallback when no annotation files exist yet
@@ -687,6 +737,8 @@ final class TranscriptMonitor {
         let outputTokens = (obj["output_tokens"] as? Int) ?? 0
         let content = obj["content"] as? String
         let contentLength = content?.count ?? 0
+        let toolCalls = obj["tool_calls"] as? [Any]
+        let hasToolCalls = !(toolCalls?.isEmpty ?? true)
 
         let obsMs: Double? = (type == "PLANNER_RESPONSE" && status == "DONE") ? liveArrivalMs : nil
         return ParsedStep(
@@ -699,6 +751,7 @@ final class TranscriptMonitor {
             cacheReadTokens: cacheReadTokens,
             outputTokens: outputTokens,
             contentLength: contentLength,
+            hasToolCalls: hasToolCalls,
             observedDoneMs: obsMs
         )
     }
@@ -806,30 +859,52 @@ final class TranscriptMonitor {
 
             var dt: Double? = nil
 
-            // Priority 1: Live hook timing paired with live VNODE observation or Stop hook
-            if let matchingHook = hookTimings.last(where: {
-                ($0.initialNumSteps ?? Int.max) <= step.stepIndex && $0.preInvocationMs != nil
+            // Priority 1: Exact hook timing matched to this specific step (stepIndex + createdAt window)
+            if let matchingHook = hookTimings.last(where: { hook in
+                guard let preMs = hook.preInvocationMs else { return false }
+                if let initSteps = hook.initialNumSteps {
+                    let delta = step.stepIndex - initSteps
+                    if delta < 0 || delta > 3 { return false }
+                }
+                if let created = step.createdAt {
+                    if abs((preMs / 1000.0) - created.timeIntervalSince1970) > 6.0 {
+                        return false
+                    }
+                }
+                return true
             }), let preMs = matchingHook.preInvocationMs {
-                if let obsMs = step.observedDoneMs, obsMs > preMs {
-                    dt = (obsMs - preMs) / 1000.0
-                } else if idx == parsedSteps.count - 1,
-                          let stopMs = matchingHook.stopMs,
-                          stopMs > preMs {
+                if !step.hasToolCalls, let stopMs = matchingHook.stopMs, stopMs > preMs {
                     dt = (stopMs - preMs) / 1000.0
+                } else if let obsMs = step.observedDoneMs, obsMs > preMs {
+                    dt = (obsMs - preMs) / 1000.0
                 }
             }
 
-            // Priority 2: Transcript timestamp delta to immediate next step
-            if dt == nil, idx + 1 < parsedSteps.count,
-               let start = step.createdAt,
-               let end = parsedSteps[idx + 1].createdAt {
-                let diff = end.timeIntervalSince(start)
-                if diff >= 0.8 && diff <= 300.0 {
+            // Priority 2: Transcript timestamp delta to immediate execution step ONLY
+            // (NEVER measure against USER_INPUT or SYSTEM_MESSAGE, which include human reading/idle time!)
+            if dt == nil, idx + 1 < parsedSteps.count {
+                let nextStep = parsedSteps[idx + 1]
+                if nextStep.type == "GENERIC" || nextStep.type == "CHECKPOINT",
+                   let start = step.createdAt,
+                   let end = nextStep.createdAt {
+                    let diff = end.timeIntervalSince(start)
+                    if diff >= 0.8 && diff <= 180.0 {
+                        dt = diff
+                    }
+                }
+            }
+
+            // Priority 3: Live VNODE arrival timestamp for final text replies without a matching hook
+            if dt == nil, !step.hasToolCalls,
+               let obsMs = step.observedDoneMs,
+               let start = step.createdAt {
+                let diff = (obsMs / 1000.0) - start.timeIntervalSince1970
+                if diff >= 0.4 && diff <= 180.0 {
                     dt = diff
                 }
             }
 
-            if let duration = dt, duration >= 0.4 {
+            if let duration = dt, duration >= 0.4, duration <= 180.0 {
                 let speed = Double(step.outputTokens) / duration
                 if speed.isFinite && speed > 0 && speed <= 800.0 {
                     turnSpeeds.append((speed, step.outputTokens, duration))
