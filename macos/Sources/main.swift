@@ -26,7 +26,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let transcriptMonitor = TranscriptMonitor(state: hudState, quotaClient: quota)
         self.monitor = transcriptMonitor
 
-        var trackerRef: WindowTracker?
         let rootView = HUDView(
             state: hudState,
             onRefreshQuota: { [weak quota] in
@@ -34,10 +33,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             onExpandQuota: { [weak quota] in
                 quota?.refresh(force: false)
-            },
-            onToggleAlwaysOnTop: { [weak hudState] in
-                guard let hudState else { return }
-                trackerRef?.setAlwaysOnTop(!hudState.alwaysOnTop)
             },
             onToggleMiniPill: { [weak hudState] in
                 hudState?.updatePrefs { prefs in
@@ -63,7 +58,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
 
         let tracker = WindowTracker(state: hudState, panel: hudPanel, monitor: transcriptMonitor)
-        trackerRef = tracker
         self.windowTracker = tracker
         hudPanel.onDragStateChanged = { [weak tracker] dragging in
             tracker?.setDragging(dragging)

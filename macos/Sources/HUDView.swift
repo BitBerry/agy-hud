@@ -14,7 +14,6 @@ struct HUDView: View {
     @ObservedObject var state: HUDState
     let onRefreshQuota: () -> Void
     let onExpandQuota: () -> Void
-    let onToggleAlwaysOnTop: () -> Void
     let onToggleMiniPill: () -> Void
     let onSizeChange: (CGSize) -> Void
 
@@ -151,19 +150,6 @@ struct HUDView: View {
             }
 
             Spacer(minLength: 4)
-
-            Button(action: onToggleAlwaysOnTop) {
-                Image(systemName: state.alwaysOnTop ? "pin.fill" : "pin")
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(state.alwaysOnTop ? Color.accentColor : Color.secondary)
-                    .frame(width: 20, height: 20)
-                    .background(
-                        RoundedRectangle(cornerRadius: 5)
-                            .fill(state.alwaysOnTop ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.06))
-                    )
-            }
-            .buttonStyle(.plain)
-            .help(state.alwaysOnTop ? "全局置顶（点击切换为仅 Antigravity 前台显示）" : "仅 Antigravity 前台显示（点击固定置顶）")
 
             Button(action: onToggleMiniPill) {
                 Image(systemName: "minus")
