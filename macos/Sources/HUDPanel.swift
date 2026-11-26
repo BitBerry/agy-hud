@@ -132,6 +132,14 @@ final class HUDPanel: NSPanel {
         }
     }
 
+    func syncToFittingSize(clamp: ((NSPoint, NSSize) -> NSPoint)? = nil) {
+        guard let hostingView else { return }
+        hostingView.layoutSubtreeIfNeeded()
+        let fit = hostingView.fittingSize
+        guard fit.width > 20 && fit.height > 20 else { return }
+        updateSize(width: fit.width, height: fit.height, clamp: clamp)
+    }
+
     func updateSize(width: CGFloat, height: CGFloat, clamp: ((NSPoint, NSSize) -> NSPoint)? = nil) {
         let clampedHeight = max(32, min(680, ceil(height)))
         let targetSize = NSSize(width: width, height: clampedHeight)

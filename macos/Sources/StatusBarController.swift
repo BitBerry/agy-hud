@@ -90,8 +90,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
+        let quotaVisibleAndExpanded = state.isQuotaExpanded && !state.isMiniPill && !state.userHidden
         let quotaToggle = NSMenuItem(
-            title: state.isQuotaExpanded ? "折叠配额面板" : "展开配额面板",
+            title: quotaVisibleAndExpanded ? "折叠配额面板" : "展开配额面板",
             action: #selector(toggleQuota),
             keyEquivalent: ""
         )
@@ -140,8 +141,14 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func toggleMiniPill() {
-        state.updatePrefs { prefs in
-            prefs.miniPill.toggle()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if self.state.userHidden {
+                self.windowTracker.setUserHidden(false)
+            }
+            self.state.updatePrefs { prefs in
+                prefs.miniPill.toggle()
+            }
         }
     }
 
@@ -155,7 +162,24 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func toggleQuota() {
-        state.isQuotaExpanded.toggle()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let currentlyShowingExpanded = self.state.isQuotaExpanded && !self.state.isMiniPill && !self.state.userHidden
+            if currentlyShowingExpanded {
+                self.state.isQuotaExpanded = false
+            } else {
+                if self.state.userHidden {
+                    self.windowTracker.setUserHidden(false)
+                }
+                if self.state.isMiniPill {
+                    self.state.updatePrefs { prefs in
+                        prefs.miniPill = false
+                    }
+                }
+                self.state.isQuotaExpanded = true
+                self.quotaClient.refresh(force: false)
+            }
+        }
     }
 
     @objc private func refreshQuota() {

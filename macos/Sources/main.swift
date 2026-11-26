@@ -50,13 +50,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hudPanel = HUDPanel(rootView: rootView, cornerRadius: hudState.isMiniPill ? 17 : 14)
         self.panel = hudPanel
 
-        hudState.$isMiniPill
-            .receive(on: DispatchQueue.main)
-            .sink { [weak hudPanel] isMiniPill in
-                hudPanel?.setCornerRadius(isMiniPill ? 17 : 14)
-            }
-            .store(in: &cancellables)
-
         let tracker = WindowTracker(state: hudState, panel: hudPanel, monitor: transcriptMonitor)
         self.windowTracker = tracker
         hudPanel.onDragStateChanged = { [weak tracker] dragging in
@@ -65,6 +58,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hudPanel.constrainOrigin = { [weak tracker] origin, size in
             tracker?.clampOrigin(origin, size: size) ?? origin
         }
+
+        hudState.$isMiniPill
+            .receive(on: DispatchQueue.main)
+            .sink { [weak hudPanel, weak tracker] isMiniPill in
+                hudPanel?.setCornerRadius(isMiniPill ? 17 : 14)
+                DispatchQueue.main.async {
+                    hudPanel?.syncToFittingSize { origin, size in
+                        tracker?.clampOrigin(origin, size: size) ?? origin
+                    }
+                }
+            }
+            .store(in: &cancellables)
+
+        hudState.$isQuotaExpanded
+            .receive(on: DispatchQueue.main)
+            .sink { [weak hudPanel, weak tracker] _ in
+                DispatchQueue.main.async {
+                    hudPanel?.syncToFittingSize { origin, size in
+                        tracker?.clampOrigin(origin, size: size) ?? origin
+                    }
+                }
+            }
+            .store(in: &cancellables)
 
         self.statusBar = StatusBarController(
             state: hudState,
