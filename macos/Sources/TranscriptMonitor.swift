@@ -12,8 +12,14 @@ final class TranscriptMonitor {
         let cacheReadTokens: Int
         let outputTokens: Int
         let contentLength: Int
-        let textPreview: String?
         let observedDoneMs: Double?
+    }
+
+    private struct AnnotationEntry {
+        let conversationId: String
+        let mtime: Date
+        let title: String?
+        let lastUserViewTime: Double?
     }
 
     private let state: HUDState
@@ -28,15 +34,18 @@ final class TranscriptMonitor {
 
     private var vnodeSource: DispatchSourceFileSystemObject?
     private var vnodeFd: Int32 = -1
+    private var annotationsDirSource: DispatchSourceFileSystemObject?
+    private var annotationsDirFd: Int32 = -1
     private var pollTimer: Timer?
     private var lastConversationScanAt: Date = .distantPast
     private var lastTitleFetchAt: Date = .distantPast
     private var cachedTitles: [String: String] = [:]
+    private var annotationCache: [String: AnnotationEntry] = [:]
 
     private var observedThresholds: [String: Int] = [:]
     private var hookTimingsByConv: [String: [HookTimingRecord]] = [:]
+    private var generatingStartByConv: [String: Date] = [:]
     private var hookActiveConvId: String = ""
-    private var hookActiveTranscriptPath: String = ""
     private var hookActiveModel: String = ""
     private var hookLastEventAt: Date = .distantPast
 
@@ -45,10 +54,12 @@ final class TranscriptMonitor {
         self.quotaClient = quotaClient
         loadRuntimeStateSeed()
         calibrateCompactionThresholdsAsync()
+        startAnnotationsDirWatch()
         refreshNow(scanConversations: true)
     }
 
     func start() {
+        startAnnotationsDirWatch()
         scheduleTimer()
     }
 
@@ -56,6 +67,7 @@ final class TranscriptMonitor {
         pollTimer?.invalidate()
         pollTimer = nil
         stopVnodeWatch()
+        stopAnnotationsDirWatch()
     }
 
     func updatePollingCadence() {
@@ -71,16 +83,16 @@ final class TranscriptMonitor {
 
     func handleHookEvent(_ msg: HookIPCMessage) {
         let convId = msg.conversationId ?? ""
+        let eventDate = Date(timeIntervalSince1970: msg.tsMs / 1000.0)
         if !convId.isEmpty {
             hookActiveConvId = convId
-        }
-        if let path = msg.transcriptPath, !path.isEmpty {
-            hookActiveTranscriptPath = path
         }
         if let model = msg.modelName, !model.isEmpty {
             hookActiveModel = model
         }
-        hookLastEventAt = Date(timeIntervalSince1970: msg.tsMs / 1000.0)
+        if msg.event == "SessionStart" || msg.event == "PreInvocation" {
+            hookLastEventAt = eventDate
+        }
 
         if !convId.isEmpty {
             var records = hookTimingsByConv[convId] ?? []
@@ -97,10 +109,7 @@ final class TranscriptMonitor {
                 if records.count > 40 {
                     records.removeFirst(records.count - 40)
                 }
-                if state.pinnedConversationId == nil || state.pinnedConversationId == convId {
-                    state.isGenerating = true
-                    state.generatingStartedAt = Date(timeIntervalSince1970: msg.tsMs / 1000.0)
-                }
+                generatingStartByConv[convId] = eventDate
             case "PostInvocation":
                 if let idx = records.lastIndex(where: { $0.invocationNum == msg.invocationNum || $0.postInvocationMs == nil }) {
                     records[idx].postInvocationMs = msg.tsMs
@@ -109,15 +118,9 @@ final class TranscriptMonitor {
                 if let idx = records.lastIndex(where: { $0.stopMs == nil }) {
                     records[idx].stopMs = msg.tsMs
                 }
-                if state.pinnedConversationId == nil || state.pinnedConversationId == convId {
-                    state.isGenerating = false
-                    state.generatingStartedAt = nil
-                }
+                generatingStartByConv.removeValue(forKey: convId)
             case "SessionStart":
-                if state.pinnedConversationId == nil || state.pinnedConversationId == convId {
-                    state.isGenerating = false
-                    state.generatingStartedAt = nil
-                }
+                generatingStartByConv.removeValue(forKey: convId)
             default:
                 break
             }
@@ -131,12 +134,10 @@ final class TranscriptMonitor {
     private func scheduleTimer() {
         pollTimer?.invalidate()
         let interval: TimeInterval
-        if !state.isVisible && !state.isGenerating {
+        if !state.isVisible && generatingStartByConv.isEmpty {
             interval = 4.0
-        } else if state.isGenerating {
-            interval = 0.5
         } else {
-            interval = 1.5
+            interval = 0.5
         }
         pollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
@@ -147,15 +148,16 @@ final class TranscriptMonitor {
 
     func refreshNow(scanConversations: Bool) {
         quotaClient?.loadFromDiskIfNewer()
+        scanAnnotationsFast()
 
         let now = Date()
-        if scanConversations || now.timeIntervalSince(lastConversationScanAt) >= 5.0 {
+        if scanConversations || now.timeIntervalSince(lastConversationScanAt) >= 4.0 {
             lastConversationScanAt = now
             refreshRecentConversations()
         }
 
         let target = resolveTargetTranscript()
-        if target.path != activePath {
+        if target.conversationId != activeConversationId || target.path != activePath {
             switchToTranscript(path: target.path, conversationId: target.conversationId)
         } else if !activePath.isEmpty {
             readAppendedBytes(liveArrivalMs: now.timeIntervalSince1970 * 1000.0)
@@ -163,6 +165,177 @@ final class TranscriptMonitor {
 
         recomputeMetrics()
     }
+
+    // MARK: - Annotations (`last_user_view_time`) Tracking
+
+    private func startAnnotationsDirWatch() {
+        guard annotationsDirSource == nil else { return }
+        let dirPath = AppPaths.annotationsDir.path
+        let fd = open(dirPath, O_EVTONLY)
+        guard fd >= 0 else { return }
+        annotationsDirFd = fd
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .extend, .rename],
+            queue: DispatchQueue.main
+        )
+        source.setEventHandler { [weak self] in
+            self?.refreshNow(scanConversations: false)
+        }
+        source.setCancelHandler { [weak self] in
+            guard let self else { return }
+            if self.annotationsDirFd >= 0 {
+                close(self.annotationsDirFd)
+                self.annotationsDirFd = -1
+            }
+        }
+        annotationsDirSource = source
+        source.resume()
+    }
+
+    private func stopAnnotationsDirWatch() {
+        annotationsDirSource?.cancel()
+        annotationsDirSource = nil
+        if annotationsDirFd >= 0 {
+            close(annotationsDirFd)
+            annotationsDirFd = -1
+        }
+    }
+
+    private func scanAnnotationsFast() {
+        let fm = FileManager.default
+        let dirPath = AppPaths.annotationsDir.path
+        guard let files = try? fm.contentsOfDirectory(atPath: dirPath) else { return }
+
+        var liveIds = Set<String>()
+        for file in files where file.hasSuffix(".pbtxt") {
+            let convId = String(file.dropLast(6))
+            guard !convId.isEmpty else { continue }
+            liveIds.insert(convId)
+
+            let fullPath = "\(dirPath)/\(file)"
+            guard let attrs = try? fm.attributesOfItem(atPath: fullPath),
+                  let mtime = attrs[.modificationDate] as? Date else {
+                continue
+            }
+
+            if let cached = annotationCache[convId],
+               abs(cached.mtime.timeIntervalSince(mtime)) < 0.001 {
+                continue
+            }
+
+            if let content = try? String(contentsOfFile: fullPath, encoding: .utf8) {
+                let parsedTitle = Self.parsePbtxtTitle(content)
+                let viewTime = Self.parseLastUserViewTime(content)
+                let entry = AnnotationEntry(
+                    conversationId: convId,
+                    mtime: mtime,
+                    title: parsedTitle,
+                    lastUserViewTime: viewTime
+                )
+                annotationCache[convId] = entry
+                if let parsedTitle, !parsedTitle.isEmpty {
+                    cachedTitles[convId] = parsedTitle
+                    if convId == activeConversationId {
+                        state.conversationTitle = parsedTitle
+                    }
+                }
+            }
+        }
+
+        for oldKey in annotationCache.keys where !liveIds.contains(oldKey) {
+            annotationCache.removeValue(forKey: oldKey)
+        }
+    }
+
+    private func mostRecentlyViewedAnnotation() -> AnnotationEntry? {
+        var best: AnnotationEntry?
+        for entry in annotationCache.values {
+            guard let vt = entry.lastUserViewTime else { continue }
+            if let cur = best, let curVt = cur.lastUserViewTime {
+                if vt > curVt { best = entry }
+            } else {
+                best = entry
+            }
+        }
+        return best
+    }
+
+    private static let viewTimeRegex = try! NSRegularExpression(
+        pattern: #"last_user_view_time\s*:\s*\{[^}]*seconds\s*:\s*(\d+)(?:[^}]*nanos\s*:\s*(\d+))?[^}]*\}"#
+    )
+
+    private static let titleRegex = try! NSRegularExpression(
+        pattern: #"title\s*:\s*"((?:[^"\\]|\\.)*)""#
+    )
+
+    private static func parseLastUserViewTime(_ content: String) -> Double? {
+        let ns = content as NSString
+        let range = NSRange(location: 0, length: ns.length)
+        guard let match = viewTimeRegex.firstMatch(in: content, range: range),
+              match.range(at: 1).location != NSNotFound,
+              let secs = Double(ns.substring(with: match.range(at: 1))) else {
+            return nil
+        }
+        var nanos = 0.0
+        if match.range(at: 2).location != NSNotFound,
+           let n = Double(ns.substring(with: match.range(at: 2))) {
+            nanos = n
+        }
+        return secs + nanos / 1_000_000_000.0
+    }
+
+    private static func parsePbtxtTitle(_ content: String) -> String? {
+        let ns = content as NSString
+        let range = NSRange(location: 0, length: ns.length)
+        guard let match = titleRegex.firstMatch(in: content, range: range),
+              match.range(at: 1).location != NSNotFound else {
+            return nil
+        }
+        let raw = ns.substring(with: match.range(at: 1))
+        let unescaped = unescapePbtxtString(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+        return unescaped.isEmpty ? nil : unescaped
+    }
+
+    private static func unescapePbtxtString(_ raw: String) -> String {
+        var bytes: [UInt8] = []
+        let chars = Array(raw)
+        var i = 0
+        while i < chars.count {
+            if chars[i] == "\\", i + 1 < chars.count {
+                let next = chars[i + 1]
+                if next >= "0" && next <= "7" {
+                    var octal = ""
+                    var j = i + 1
+                    while j < chars.count && j < i + 4 && chars[j] >= "0" && chars[j] <= "7" {
+                        octal.append(chars[j])
+                        j += 1
+                    }
+                    if let val = UInt8(octal, radix: 8) {
+                        bytes.append(val)
+                        i = j
+                        continue
+                    }
+                }
+                switch next {
+                case "n": bytes.append(0x0A)
+                case "r": bytes.append(0x0D)
+                case "t": bytes.append(0x09)
+                case "\"": bytes.append(0x22)
+                case "\\": bytes.append(0x5C)
+                default: bytes.append(contentsOf: String(next).utf8)
+                }
+                i += 2
+            } else {
+                bytes.append(contentsOf: String(chars[i]).utf8)
+                i += 1
+            }
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    // MARK: - Seed, Calibration, and Recent Conversations
 
     private func loadRuntimeStateSeed() {
         guard let data = try? Data(contentsOf: AppPaths.runtimeStateURL),
@@ -175,9 +348,6 @@ final class TranscriptMonitor {
         if let conv = runtime.activeConversationId, !conv.isEmpty {
             hookActiveConvId = conv
         }
-        if let path = runtime.activeTranscriptPath, !path.isEmpty {
-            hookActiveTranscriptPath = path
-        }
         if let model = runtime.activeModelName, !model.isEmpty {
             hookActiveModel = model
         }
@@ -185,9 +355,9 @@ final class TranscriptMonitor {
             hookLastEventAt = Date(timeIntervalSince1970: ms / 1000.0)
         }
         if runtime.isGenerating == true,
+           !hookActiveConvId.isEmpty,
            Date().timeIntervalSince(hookLastEventAt) < 120 {
-            state.isGenerating = true
-            state.generatingStartedAt = hookLastEventAt
+            generatingStartByConv[hookActiveConvId] = hookLastEventAt
         }
     }
 
@@ -255,15 +425,18 @@ final class TranscriptMonitor {
         let brainPath = AppPaths.brainDir.path
         guard let dirs = try? fm.contentsOfDirectory(atPath: brainPath) else { return }
 
-        var candidates: [(id: String, path: String, mtime: Date)] = []
+        var candidates: [(id: String, path: String, sortTime: Date)] = []
         for dir in dirs {
             let tPath = "\(brainPath)/\(dir)/.system_generated/logs/transcript.jsonl"
-            if let attrs = try? fm.attributesOfItem(atPath: tPath),
-               let mtime = attrs[.modificationDate] as? Date {
-                candidates.append((dir, tPath, mtime))
+            guard let attrs = try? fm.attributesOfItem(atPath: tPath),
+                  let mtime = attrs[.modificationDate] as? Date else {
+                continue
             }
+            let viewDate = annotationCache[dir]?.lastUserViewTime.map { Date(timeIntervalSince1970: $0) }
+            let sortTime = viewDate.map { max($0, mtime) } ?? mtime
+            candidates.append((dir, tPath, sortTime))
         }
-        candidates.sort { $0.mtime > $1.mtime }
+        candidates.sort { $0.sortTime > $1.sortTime }
 
         if Date().timeIntervalSince(lastTitleFetchAt) > 30,
            quotaClient?.hasLiveCredentials == true {
@@ -280,14 +453,17 @@ final class TranscriptMonitor {
         updateConversationChoices(candidates: candidates)
     }
 
-    private func updateConversationChoices(candidates: [(id: String, path: String, mtime: Date)]) {
+    private func updateConversationChoices(candidates: [(id: String, path: String, sortTime: Date)]) {
         var choices: [ConversationChoice] = []
         for item in candidates.prefix(8) {
-            let title = cachedTitles[item.id] ?? extractTitleFromTranscriptHead(path: item.path) ?? String(item.id.prefix(8))
+            let title = cachedTitles[item.id]
+                ?? annotationCache[item.id]?.title
+                ?? extractTitleFromTranscriptHead(path: item.path)
+                ?? String(item.id.prefix(8))
             choices.append(ConversationChoice(
                 id: item.id,
                 title: title,
-                updatedAt: item.mtime,
+                updatedAt: item.sortTime,
                 transcriptPath: item.path,
                 modelId: nil
             ))
@@ -296,7 +472,7 @@ final class TranscriptMonitor {
     }
 
     private func extractTitleFromTranscriptHead(path: String) -> String? {
-        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        guard !path.isEmpty, let fh = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? fh.close() }
         let chunk = fh.readData(ofLength: 16 * 1024)
         guard let text = String(data: chunk, encoding: .utf8) else { return nil }
@@ -316,47 +492,58 @@ final class TranscriptMonitor {
                 .replacingOccurrences(of: "\n", with: " ")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if !cleaned.isEmpty {
-                let truncated = cleaned.count > 34 ? String(cleaned.prefix(34)) + "…" : cleaned
-                return truncated
+                return cleaned.count > 34 ? String(cleaned.prefix(34)) + "…" : cleaned
             }
         }
         return nil
     }
 
-    private func resolveTargetTranscript() -> (path: String, conversationId: String) {
-        let fm = FileManager.default
-
-        if let pinned = state.pinnedConversationId, !pinned.isEmpty {
-            let pinnedPath = AppPaths.brainDir
-                .appendingPathComponent(pinned)
-                .appendingPathComponent(".system_generated/logs/transcript.jsonl").path
-            if fm.fileExists(atPath: pinnedPath) {
-                return (pinnedPath, pinned)
-            }
+    private func transcriptPath(for conversationId: String) -> String {
+        let compact = AppPaths.brainDir
+            .appendingPathComponent(conversationId)
+            .appendingPathComponent(".system_generated/logs/transcript.jsonl").path
+        if FileManager.default.fileExists(atPath: compact) {
+            return compact
         }
-
-        // Prefer hook-reported transcript if hook fired within last 2 minutes
-        if !hookActiveTranscriptPath.isEmpty,
-           Date().timeIntervalSince(hookLastEventAt) < 120,
-           fm.fileExists(atPath: hookActiveTranscriptPath) {
-            let conv = hookActiveConvId.isEmpty ? conversationId(fromPath: hookActiveTranscriptPath) : hookActiveConvId
-            return (hookActiveTranscriptPath, conv)
-        }
-
-        if let newest = state.recentConversations.first {
-            return (newest.transcriptPath, newest.id)
-        }
-
-        return ("", "")
-    }
-
-    private func conversationId(fromPath path: String) -> String {
-        let components = URL(fileURLWithPath: path).pathComponents
-        if let brainIdx = components.firstIndex(of: "brain"), brainIdx + 1 < components.count {
-            return components[brainIdx + 1]
+        let full = AppPaths.brainDir
+            .appendingPathComponent(conversationId)
+            .appendingPathComponent(".system_generated/logs/transcript_full.jsonl").path
+        if FileManager.default.fileExists(atPath: full) {
+            return full
         }
         return ""
     }
+
+    private func resolveTargetTranscript() -> (path: String, conversationId: String) {
+        // 1. User manually pinned a specific conversation in the Menu Bar
+        if let pinned = state.pinnedConversationId, !pinned.isEmpty {
+            return (transcriptPath(for: pinned), pinned)
+        }
+
+        // 2. Primary source: Antigravity's `annotations/<id>.pbtxt` `last_user_view_time`
+        if let viewed = mostRecentlyViewedAnnotation(), let viewedSec = viewed.lastUserViewTime {
+            // Only prefer a brand-new hook conversation if it has no annotation view time yet
+            // AND started strictly after the last viewed conversation.
+            if !hookActiveConvId.isEmpty,
+               hookActiveConvId != viewed.conversationId,
+               annotationCache[hookActiveConvId]?.lastUserViewTime == nil,
+               hookLastEventAt.timeIntervalSince1970 > viewedSec {
+                return (transcriptPath(for: hookActiveConvId), hookActiveConvId)
+            }
+            return (transcriptPath(for: viewed.conversationId), viewed.conversationId)
+        }
+
+        // 3. Fallback when no annotation files exist yet
+        if !hookActiveConvId.isEmpty {
+            return (transcriptPath(for: hookActiveConvId), hookActiveConvId)
+        }
+        if let newest = state.recentConversations.first {
+            return (newest.transcriptPath, newest.id)
+        }
+        return ("", "")
+    }
+
+    // MARK: - Transcript Reading & VNODE Watch
 
     private func switchToTranscript(path: String, conversationId: String) {
         stopVnodeWatch()
@@ -369,7 +556,8 @@ final class TranscriptMonitor {
 
         state.conversationId = conversationId
         if !conversationId.isEmpty {
-            if let cached = cachedTitles[conversationId] {
+            if let cached = cachedTitles[conversationId] ?? annotationCache[conversationId]?.title {
+                cachedTitles[conversationId] = cached
                 state.conversationTitle = cached
             } else if let extracted = extractTitleFromTranscriptHead(path: path) {
                 cachedTitles[conversationId] = extracted
@@ -511,12 +699,28 @@ final class TranscriptMonitor {
             cacheReadTokens: cacheReadTokens,
             outputTokens: outputTokens,
             contentLength: contentLength,
-            textPreview: nil,
             observedDoneMs: obsMs
         )
     }
 
+    // MARK: - Metrics Calculation
+
     private func recomputeMetrics() {
+        // Per-conversation generating indicator
+        if let started = generatingStartByConv[activeConversationId] {
+            if Date().timeIntervalSince(started) > 180 {
+                generatingStartByConv.removeValue(forKey: activeConversationId)
+                state.isGenerating = false
+                state.generatingStartedAt = nil
+            } else {
+                state.isGenerating = true
+                state.generatingStartedAt = started
+            }
+        } else {
+            state.isGenerating = false
+            state.generatingStartedAt = nil
+        }
+
         let planners = parsedSteps.filter { $0.type == "PLANNER_RESPONSE" }
         let latestPlanner = planners.last
 
@@ -649,14 +853,6 @@ final class TranscriptMonitor {
             state.avgTps = nil
             state.peakTps = nil
             state.recentTps = []
-        }
-
-        // Fallback idle check if generating flag lingered without Stop hook
-        if state.isGenerating,
-           let started = state.generatingStartedAt,
-           Date().timeIntervalSince(started) > 180 {
-            state.isGenerating = false
-            state.generatingStartedAt = nil
         }
     }
 }

@@ -12,6 +12,10 @@ enum AppPaths {
         home.appendingPathComponent(".gemini/antigravity/brain", isDirectory: true)
     }
 
+    static var annotationsDir: URL {
+        home.appendingPathComponent(".gemini/antigravity/annotations", isDirectory: true)
+    }
+
     static var socketURL: URL {
         dataDir.appendingPathComponent("hud.sock")
     }
