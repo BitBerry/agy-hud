@@ -1,0 +1,28 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "agy-hud",
+  "displayName": "Display HUD",
+  "version": "1.0.0",
+  "description": "macOS floating HUD overlay showing live context length, TPS, compaction length, and collapsible model quota.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Check my current session context length and TPS",
+    "Show remaining model quota and reset countdown",
+    "Check if this conversation has triggered context compaction"
+  ],
+  "author": {
+    "name": "BitBerry",
+    "url": "https://github.com/BitBerry"
+  },
+  "homepage": "https://github.com/BitBerry/agy-hud",
+  "repository": "https://github.com/BitBerry/agy-hud",
+  "license": "MIT",
+  "keywords": [
+    "hud",
+    "context",
+    "tps",
+    "quota",
+    "compaction",
+    "monitor"
+  ]
+}
