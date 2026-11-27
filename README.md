@@ -41,12 +41,12 @@ An Antigravity display enhancement plugin with a native macOS floating HUD (`Agy
 bash scripts/build-and-install.sh
 ```
 
-The script compiles `AgyHUD.app`, ad-hoc signs it, installs the plugin into `~/.gemini/config/plugins/agy-hud/`, installs `AgyHUD.app` into `~/.gemini/antigravity/plugin_data/agy-hud/AgyHUD.app` (and copies a build artifact to `~/Downloads/AgyHUD.app`), and validates the bundle with `agy plugin validate --strict`.
+The script compiles `AgyHUD.app`, ad-hoc signs it, installs the plugin into `~/.gemini/config/plugins/agy-hud/`, installs `AgyHUD.app` into `/Applications/AgyHUD.app`, and validates the bundle with `agy plugin validate --strict`.
 
 To launch immediately after install:
 
 ```bash
-open -g -a ~/.gemini/antigravity/plugin_data/agy-hud/AgyHUD.app
+open -g -a AgyHUD
 ```
 
 ## Project Structure

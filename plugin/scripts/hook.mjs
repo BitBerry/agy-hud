@@ -117,8 +117,11 @@ function maybeLaunchApp() {
     const prefs = safeReadJson(path.join(HUD_HOME, 'prefs.json'));
     if (!prefs || prefs.autoLaunch !== true) return;
 
-    const appPath = path.join(HUD_HOME, 'AgyHUD.app');
-    if (!fs.existsSync(appPath)) return;
+    const appPath = [
+      '/Applications/AgyHUD.app',
+      path.join(HUD_HOME, 'AgyHUD.app'),
+    ].find((candidate) => fs.existsSync(candidate));
+    if (!appPath) return;
 
     const stampPath = path.join(HUD_HOME, '.last-launch');
     const now = Date.now();

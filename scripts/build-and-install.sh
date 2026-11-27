@@ -8,8 +8,10 @@ BUILD_APP="${ROOT_DIR}/build/AgyHUD.app"
 
 PLUGIN_DEST="${HOME}/.gemini/config/plugins/agy-hud"
 DATA_DEST="${HOME}/.gemini/antigravity/plugin_data/agy-hud"
-INSTALLED_APP="${DATA_DEST}/AgyHUD.app"
-DOWNLOADS_APP="${HOME}/Downloads/AgyHUD.app"
+INSTALLED_APP="/Applications/AgyHUD.app"
+LEGACY_DATA_APP="${DATA_DEST}/AgyHUD.app"
+LEGACY_DOWNLOADS_APP="${HOME}/Downloads/AgyHUD.app"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 echo "==> Compiling AgyHUD.app..."
 rm -rf "${BUILD_APP}"
@@ -54,12 +56,19 @@ if pgrep -x AgyHUD >/dev/null 2>&1; then
   pkill -KILL -x AgyHUD 2>/dev/null || true
 fi
 
+# Remove duplicate copies so LaunchServices / Spotlight only list /Applications/AgyHUD.app
+for stale in "${LEGACY_DATA_APP}" "${LEGACY_DOWNLOADS_APP}"; do
+  if [[ -e "${stale}" ]]; then
+    "${LSREGISTER}" -u "${stale}" >/dev/null 2>&1 || true
+    rm -rf "${stale}"
+  fi
+done
+
 rm -rf "${INSTALLED_APP}"
 cp -R "${BUILD_APP}" "${INSTALLED_APP}"
-
-echo "==> Copying build artifact to ${DOWNLOADS_APP}..."
-rm -rf "${DOWNLOADS_APP}"
-cp -R "${BUILD_APP}" "${DOWNLOADS_APP}"
+"${LSREGISTER}" -u "${BUILD_APP}" >/dev/null 2>&1 || true
+rm -rf "${BUILD_APP}"
+"${LSREGISTER}" -f "${INSTALLED_APP}" >/dev/null 2>&1 || true
 
 echo "==> Validating plugin with agy plugin validate --strict..."
 agy plugin validate --strict "${PLUGIN_DEST}"
