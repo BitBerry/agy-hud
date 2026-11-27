@@ -1,27 +1,64 @@
 import Foundation
 import Combine
 
+/// The two Antigravity front ends. They share the plugin, but each keeps its own
+/// conversation store and hands hooks its own PLUGIN_DATA directory.
+enum AgentSource: String, Codable, CaseIterable {
+    case desktop
+    case cli
+
+    var rootDir: URL {
+        let name = self == .desktop ? "antigravity" : "antigravity-cli"
+        return AppPaths.home.appendingPathComponent(".gemini/\(name)", isDirectory: true)
+    }
+
+    var brainDir: URL {
+        rootDir.appendingPathComponent("brain", isDirectory: true)
+    }
+
+    var annotationsDir: URL {
+        rootDir.appendingPathComponent("annotations", isDirectory: true)
+    }
+
+    /// Written by hook.mjs into that front end's own PLUGIN_DATA.
+    var runtimeStateURL: URL {
+        rootDir.appendingPathComponent("plugin_data/agy-hud/runtime-state.json")
+    }
+
+    var badge: String {
+        self == .desktop ? "桌面" : "CLI"
+    }
+
+    var menuTitle: String {
+        self == .desktop ? "Antigravity 桌面端" : "agy CLI"
+    }
+}
+
+enum HUDTheme: String, Codable, CaseIterable {
+    case dark
+    case light
+    case system
+
+    var menuTitle: String {
+        switch self {
+        case .dark: return "深色 HUD（高对比）"
+        case .light: return "浅色高对比"
+        case .system: return "跟随系统"
+        }
+    }
+}
+
 enum AppPaths {
     static let home = FileManager.default.homeDirectoryForCurrentUser
 
+    /// Single home of AgyHUD.app, its socket, prefs and quota cache, whichever
+    /// front end fired the hook.
     static var dataDir: URL {
         home.appendingPathComponent(".gemini/antigravity/plugin_data/agy-hud", isDirectory: true)
     }
 
-    static var brainDir: URL {
-        home.appendingPathComponent(".gemini/antigravity/brain", isDirectory: true)
-    }
-
-    static var annotationsDir: URL {
-        home.appendingPathComponent(".gemini/antigravity/annotations", isDirectory: true)
-    }
-
     static var socketURL: URL {
         dataDir.appendingPathComponent("hud.sock")
-    }
-
-    static var runtimeStateURL: URL {
-        dataDir.appendingPathComponent("runtime-state.json")
     }
 
     static var quotaURL: URL {
@@ -60,12 +97,23 @@ enum AppPaths {
 }
 
 struct UserPrefs: Codable, Equatable {
-    var autoLaunch: Bool = true
+    var autoLaunch: Bool = false
     var alwaysOnTop: Bool = false
     var miniPill: Bool = false
     var pinnedConversationId: String? = nil
     var customOffsetX: Double? = nil
     var customOffsetY: Double? = nil
+    /// Panel offset when docked to a terminal hosting the agy CLI.
+    var cliOffsetX: Double? = nil
+    var cliOffsetY: Double? = nil
+    /// nil follows the frontmost window; otherwise only that front end is tracked.
+    var sourceMode: AgentSource? = nil
+    /// nil defaults to high-contrast dark HUD for legibility over terminals and editors.
+    var theme: HUDTheme? = nil
+
+    var resolvedTheme: HUDTheme {
+        theme ?? .dark
+    }
 
     static func load() -> UserPrefs {
         guard let data = try? Data(contentsOf: AppPaths.prefsURL),
@@ -95,6 +143,26 @@ struct HookIPCMessage: Codable {
     let terminationReason: String?
     let lsAddress: String?
     let csrfToken: String?
+    /// "desktop" or "cli"; absent from hooks older than the CLI support.
+    let source: String?
+    /// The hook's parent pid: the agy process itself, or a shell it spawned.
+    let agentPid: Int32?
+    /// Raw AGY_CLI_AUTO_COMPACT_OVERRIDE from the CLI environment, if present.
+    let autoCompactOverride: String?
+    /// Canonical tmux server socket path from `$TMUX`, if running inside tmux.
+    let tmuxSocket: String?
+    /// Tmux pane id from `$TMUX_PANE` (e.g. `%18`), if running inside tmux.
+    let tmuxPane: String?
+
+    var agentSource: AgentSource {
+        if let source, let parsed = AgentSource(rawValue: source) {
+            return parsed
+        }
+        if let transcriptPath, transcriptPath.contains("/antigravity-cli/") {
+            return .cli
+        }
+        return .desktop
+    }
 }
 
 struct HookTimingRecord: Codable, Equatable {
@@ -110,11 +178,14 @@ struct RuntimeStateFile: Codable {
     var activeConversationId: String?
     var activeTranscriptPath: String?
     var activeModelName: String?
+    var activeAutoCompactOverride: String?
     var lastEvent: String?
     var lastEventMs: Double?
     var isGenerating: Bool?
     var lsAddress: String?
     var timings: [String: [HookTimingRecord]]?
+    var autoCompactOverrides: [String: String]?
+    var tmuxPanes: [String: String]?
 }
 
 struct CompactionRecord: Identifiable, Equatable {
@@ -143,6 +214,7 @@ struct ConversationChoice: Identifiable, Equatable {
     let updatedAt: Date
     let transcriptPath: String
     let modelId: String?
+    let source: AgentSource
 }
 
 struct QuotaCreditInfo: Codable, Equatable {
@@ -263,18 +335,19 @@ enum ModelCatalog {
         let window: Int
         let fallbackThreshold: Int
 
+        let gemini1M = 1_048_576
         switch key {
         case "gemini-4-neon":
             baseName = "Gemini 4 Neon"
-            window = 1_000_000
+            window = gemini1M
             fallbackThreshold = 512_000
         case "gemini-4-carbon":
             baseName = "Gemini 4 Carbon"
-            window = 1_000_000
+            window = gemini1M
             fallbackThreshold = 512_000
         case "gemini-4-argon":
             baseName = "Gemini 4 Argon"
-            window = 1_000_000
+            window = gemini1M
             fallbackThreshold = 512_000
         case "gemini-4-hydrogen-tiered":
             baseName = "Gemini 4 Hydrogen"
@@ -282,7 +355,7 @@ enum ModelCatalog {
             fallbackThreshold = 200_000
         case "gemini-4-hydrogen":
             baseName = "Gemini 4 Hydrogen"
-            window = 1_000_000
+            window = gemini1M
             fallbackThreshold = 512_000
         case "gemini-pro-orchestrator":
             if lower.contains("neon") {
@@ -292,11 +365,11 @@ enum ModelCatalog {
             } else {
                 baseName = "Orchestrator"
             }
-            window = 1_000_000
+            window = gemini1M
             fallbackThreshold = 512_000
         case "gemini-flash":
             baseName = lower.contains("3.8") ? "Gemini 3.8 Flash" : "Gemini Flash"
-            window = 1_000_000
+            window = gemini1M
             fallbackThreshold = 512_000
         case "claude-opus-5-5":
             baseName = "Claude Opus 5.5"
@@ -316,7 +389,7 @@ enum ModelCatalog {
             fallbackThreshold = 100_000
         default:
             baseName = prettifyModelName(modelId)
-            window = 1_000_000
+            window = gemini1M
             fallbackThreshold = 512_000
         }
 
@@ -342,6 +415,44 @@ enum ModelCatalog {
             contextWindow: window,
             defaultThreshold: threshold
         )
+    }
+
+    /// Parses AGY_CLI_AUTO_COMPACT_OVERRIDE values matching agy CLI:
+    /// token count (`700000`), `K`/`M` shorthand (`800K`, `0.5M`), or percentage (`90%`),
+    /// clamped up to the model's context window.
+    static func parseAutoCompactOverride(_ raw: String, contextWindow: Int) -> Int? {
+        guard contextWindow > 0 else { return nil }
+        let trimmed = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: ",", with: "")
+        guard !trimmed.isEmpty else { return nil }
+
+        let lower = trimmed.lowercased()
+        let computed: Double?
+        if lower.hasSuffix("%") {
+            guard let pct = Double(lower.dropLast()), pct.isFinite, pct > 0, pct <= 100 else {
+                return nil
+            }
+            computed = Double(contextWindow) * (pct / 100.0)
+        } else if lower.hasSuffix("k") {
+            guard let val = Double(lower.dropLast()), val.isFinite, val > 0 else {
+                return nil
+            }
+            computed = val * 1_000.0
+        } else if lower.hasSuffix("m") {
+            guard let val = Double(lower.dropLast()), val.isFinite, val > 0 else {
+                return nil
+            }
+            computed = val * 1_000_000.0
+        } else if let val = Double(lower), val.isFinite, val >= 1_000 {
+            computed = val
+        } else {
+            computed = nil
+        }
+
+        guard let tokens = computed else { return nil }
+        return min(contextWindow, max(1, Int(tokens.rounded())))
     }
 
     private static func prettifyModelName(_ raw: String) -> String {
@@ -378,18 +489,25 @@ enum HUDFormatters {
         return isoWithFractional.date(from: value) ?? isoBasic.date(from: value)
     }
 
-    static func formatTokens(_ count: Int) -> String {
+    static func formatTokens(_ count: Int, compact: Bool = false) -> String {
         let absVal = abs(count)
         let sign = count < 0 ? "-" : ""
         if absVal >= 1_000_000 {
             let m = Double(absVal) / 1_000_000.0
-            return String(format: "%@%.2fM", sign, m)
+            return String(format: "%@%.1fM", sign, m)
         } else if absVal >= 1_000 {
             let k = Double(absVal) / 1_000.0
-            if k >= 100 {
+            if compact && k >= 100 {
                 return String(format: "%@%.0fK", sign, k)
             }
-            return String(format: "%@%.1fK", sign, k)
+            let roundedTenths = (k * 10.0).rounded() / 10.0
+            if roundedTenths >= 1000.0 {
+                return String(format: "%@%.1fM", sign, Double(absVal) / 1_000_000.0)
+            }
+            if roundedTenths >= 100.0 && abs(roundedTenths - roundedTenths.rounded()) < 0.05 {
+                return String(format: "%@%.0fK", sign, roundedTenths)
+            }
+            return String(format: "%@%.1fK", sign, roundedTenths)
         }
         return "\(count)"
     }
@@ -464,6 +582,8 @@ enum HUDFormatters {
 @MainActor
 final class HUDState: ObservableObject {
     @Published var conversationId: String = ""
+    /// Front end the displayed conversation belongs to.
+    @Published var activeSource: AgentSource = .desktop
     @Published var conversationTitle: String = "等待对话..."
     @Published var recentConversations: [ConversationChoice] = []
 
@@ -477,7 +597,7 @@ final class HUDState: ObservableObject {
     @Published var freshInputTokens: Int = 0
     @Published var lastOutputTokens: Int = 0
     @Published var contextDelta: Int = 0
-    @Published var contextWindow: Int = 1_000_000
+    @Published var contextWindow: Int = 1_048_576
     @Published var cacheHitRate: Double = 0
 
     @Published var lastTurnTps: Double? = nil
@@ -489,6 +609,7 @@ final class HUDState: ObservableObject {
 
     @Published var compactionThreshold: Int = 512_000
     @Published var thresholdSource: String = "default"
+    @Published var thresholdOverrideLabel: String? = nil
     @Published var compactionCount: Int = 0
     @Published var lastCompaction: CompactionRecord? = nil
     @Published var allCompactions: [CompactionRecord] = []
@@ -504,6 +625,8 @@ final class HUDState: ObservableObject {
     @Published var alwaysOnTop: Bool
     @Published var autoLaunch: Bool
     @Published var pinnedConversationId: String?
+    @Published var sourceMode: AgentSource?
+    @Published var theme: HUDTheme
 
     @Published var prefs: UserPrefs
 
@@ -514,6 +637,8 @@ final class HUDState: ObservableObject {
         self.alwaysOnTop = loaded.alwaysOnTop
         self.autoLaunch = loaded.autoLaunch
         self.pinnedConversationId = loaded.pinnedConversationId
+        self.sourceMode = loaded.sourceMode
+        self.theme = loaded.resolvedTheme
     }
 
     func updatePrefs(_ mutate: (inout UserPrefs) -> Void) {
@@ -522,6 +647,8 @@ final class HUDState: ObservableObject {
         alwaysOnTop = prefs.alwaysOnTop
         autoLaunch = prefs.autoLaunch
         pinnedConversationId = prefs.pinnedConversationId
+        sourceMode = prefs.sourceMode
+        theme = prefs.resolvedTheme
         prefs.save()
     }
 }

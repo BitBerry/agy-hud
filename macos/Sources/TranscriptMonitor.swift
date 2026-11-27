@@ -16,15 +16,57 @@ final class TranscriptMonitor {
         let observedDoneMs: Double?
     }
 
+    private struct ConversationCandidate {
+        let id: String
+        let path: String
+        let sortTime: Date
+        let source: AgentSource
+    }
+
     private struct AnnotationEntry {
         let conversationId: String
+        let source: AgentSource
         let mtime: Date
         let title: String?
         let lastUserViewTime: Double?
     }
 
+    private struct CachedTranscript {
+        let path: String
+        let inode: UInt64
+        let readOffset: UInt64
+        let lineRemainder: String
+        let parsedSteps: [ParsedStep]
+        var lastUsedAt: Date
+    }
+
+    private struct HookAgentLink {
+        let conversationId: String
+        let updatedAt: Date
+        let fromSessionStart: Bool
+    }
+
+    private struct TmuxFocusKey: Equatable {
+        let socket: String
+        let paneId: String
+        let agentPid: pid_t?
+    }
+
+    private struct IPCTmuxFocusHint {
+        let socket: String
+        let paneId: String
+        let receivedAt: Date
+    }
+
+    private struct FocusedTmuxSelection {
+        let socket: String
+        let paneId: String
+        let agent: AgentProcessScanner.CLIAgent?
+    }
+
     private let state: HUDState
     private weak var quotaClient: QuotaClient?
+    private let tmuxFocusMonitor = TmuxFocusMonitor()
 
     private var activePath: String = ""
     private var activeConversationId: String = ""
@@ -32,11 +74,10 @@ final class TranscriptMonitor {
     private var readOffset: UInt64 = 0
     private var lineRemainder: String = ""
     private var parsedSteps: [ParsedStep] = []
+    private var transcriptCache: [String: CachedTranscript] = [:]
 
     private var vnodeSource: DispatchSourceFileSystemObject?
-    private var vnodeFd: Int32 = -1
-    private var annotationsDirSource: DispatchSourceFileSystemObject?
-    private var annotationsDirFd: Int32 = -1
+    private var annotationWatches: [AgentSource: DispatchSourceFileSystemObject] = [:]
     private var pollTimer: Timer?
     private var lastConversationScanAt: Date = .distantPast
     private var lastTitleFetchAt: Date = .distantPast
@@ -45,16 +86,42 @@ final class TranscriptMonitor {
     private var lastHandledViewTime: Double = 0
     private var currentAutoViewedId: String = ""
 
-    private var observedThresholds: [String: Int] = [:]
+    /// Compaction thresholds are calibrated per front end: the CLI compacts later
+    /// than the desktop app for the same model.
+    private var observedThresholds: [AgentSource: [String: Int]] = [:]
     private var hookTimingsByConv: [String: [HookTimingRecord]] = [:]
     private var generatingStartByConv: [String: Date] = [:]
-    private var hookActiveConvId: String = ""
-    private var hookActiveModel: String = ""
-    private var hookLastEventAt: Date = .distantPast
+    private var hookActiveConvBySource: [AgentSource: String] = [:]
+    private var hookLastEventAtBySource: [AgentSource: Date] = [:]
+    private var hookModelByConv: [String: String] = [:]
+    /// Live `agy` process per CLI conversation, to notice a session killed mid-turn.
+    private var agentPidByConv: [String: pid_t] = [:]
+    /// Reverse index from live `agy` pid to last hook-reported conversation.
+    private var convByAgentPid: [pid_t: HookAgentLink] = [:]
+    /// Last known conversation per `<canonicalSocket>|<paneId>` tmux pane.
+    private var convByTmuxPane: [String: String] = [:]
+    /// Per-conversation AGY_CLI_AUTO_COMPACT_OVERRIDE reported by hooks or runtime-state.json.
+    private var hookAutoCompactOverrideByConv: [String: String] = [:]
+    private var activeHookAutoCompactOverrideBySource: [AgentSource: String] = [:]
+
+    private var sourceByConv: [String: AgentSource] = [:]
+    private var newestTranscriptBySource: [AgentSource: (id: String, path: String, mtime: Date)] = [:]
+    /// Front ends shown by the most recent frontmost host window (sticky).
+    private var focusSources: Set<AgentSource> = []
+    /// PID of the most recent frontmost host app (terminal or Antigravity).
+    private var focusHostPid: pid_t? = nil
+    private var lastObservedTmuxFocus: TmuxFocusKey? = nil
+    private var lastTmuxFocusChangedAt: Date = .distantPast
+    private var lastUnmatchedPaneRescanKey: String = ""
+    private var lastUnmatchedPaneRescanAt: Date = .distantPast
+    private var ipcTmuxFocusHint: IPCTmuxFocusHint? = nil
 
     init(state: HUDState, quotaClient: QuotaClient) {
         self.state = state
         self.quotaClient = quotaClient
+        tmuxFocusMonitor.onSnapshotChanged = { [weak self] in
+            self?.handleTmuxSnapshotChanged()
+        }
         loadRuntimeStateSeed()
         calibrateCompactionThresholdsAsync()
         startAnnotationsDirWatch()
@@ -64,11 +131,15 @@ final class TranscriptMonitor {
     func start() {
         startAnnotationsDirWatch()
         scheduleTimer()
+        if state.pinnedConversationId == nil && state.sourceMode != .desktop {
+            tmuxFocusMonitor.probeNow(force: true)
+        }
     }
 
     func stop() {
         pollTimer?.invalidate()
         pollTimer = nil
+        tmuxFocusMonitor.stop()
         stopVnodeWatch()
         stopAnnotationsDirWatch()
     }
@@ -81,20 +152,104 @@ final class TranscriptMonitor {
         state.updatePrefs { prefs in
             prefs.pinnedConversationId = conversationId
         }
+        updateTmuxPollingState()
         refreshNow(scanConversations: true)
     }
 
-    func handleHookEvent(_ msg: HookIPCMessage) {
-        let convId = msg.conversationId ?? ""
-        let eventDate = Date(timeIntervalSince1970: msg.tsMs / 1000.0)
-        if !convId.isEmpty {
-            hookActiveConvId = convId
+    /// Called when a window hosting Antigravity and/or the agy CLI comes to the front.
+    func setFocusContext(sources: Set<AgentSource>, hostPid: pid_t?) {
+        guard !sources.isEmpty else { return }
+        let sourcesChanged = (sources != focusSources)
+        let hostChanged = (hostPid != focusHostPid)
+        focusSources = sources
+        if let hostPid {
+            focusHostPid = hostPid
         }
-        if let model = msg.modelName, !model.isEmpty {
-            hookActiveModel = model
+        updateTmuxPollingState()
+        if sources.contains(.cli) {
+            tmuxFocusMonitor.probeNow()
+        }
+        if sourcesChanged || hostChanged {
+            refreshNow(scanConversations: false)
+        }
+    }
+
+    func setFocusHostPid(_ hostPid: pid_t?) {
+        guard hostPid != focusHostPid else { return }
+        focusHostPid = hostPid
+        updateTmuxPollingState()
+        if focusSources.contains(.cli) {
+            tmuxFocusMonitor.probeNow()
+            refreshNow(scanConversations: false)
+        }
+    }
+
+    func handleHookEvent(_ msg: HookIPCMessage) {
+        if msg.event == "FocusPane" || msg.event == "TmuxFocus" {
+            if let rawSocket = msg.tmuxSocket, !rawSocket.isEmpty,
+               let pane = msg.tmuxPane?.trimmingCharacters(in: .whitespacesAndNewlines), !pane.isEmpty {
+                let socket = AgentProcessScanner.parseTmuxSocket(rawSocket) ?? AgentProcessScanner.canonicalPath(rawSocket)
+                if !socket.isEmpty {
+                    ipcTmuxFocusHint = IPCTmuxFocusHint(socket: socket, paneId: pane, receivedAt: Date())
+                    lastTmuxFocusChangedAt = Date()
+                }
+            }
+            AgentProcessScanner.invalidateOpenHandlesCache()
+            updateTmuxPollingState()
+            tmuxFocusMonitor.probeNow(force: true)
+            refreshNow(scanConversations: false)
+            return
+        }
+
+        let convId = msg.conversationId ?? ""
+        let source = msg.agentSource
+        let eventDate = Date(timeIntervalSince1970: msg.tsMs / 1000.0)
+        if source == .cli && msg.event == "SessionStart" {
+            AgentProcessScanner.invalidateCache()
+        }
+
+        if !convId.isEmpty {
+            hookActiveConvBySource[source] = convId
+            sourceByConv[convId] = source
+            if let model = msg.modelName, !model.isEmpty {
+                hookModelByConv[convId] = model
+            }
+
+            var resolvedAgentPid: pid_t? = nil
+            if source == .cli, let hookParent = msg.agentPid,
+               let agentPid = AgentProcessScanner.enclosingAgentPid(of: hookParent) {
+                resolvedAgentPid = agentPid
+                agentPidByConv[convId] = agentPid
+                convByAgentPid[agentPid] = HookAgentLink(
+                    conversationId: convId,
+                    updatedAt: Date(),
+                    fromSessionStart: msg.event == "SessionStart"
+                )
+                AgentProcessScanner.invalidateOpenHandlesCache(for: agentPid)
+            }
+
+            if source == .cli {
+                let msgSocket = msg.tmuxSocket.flatMap {
+                    AgentProcessScanner.parseTmuxSocket($0) ?? AgentProcessScanner.canonicalPath($0)
+                }
+                let msgPane = msg.tmuxPane?.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let paneKey = AgentProcessScanner.tmuxPaneKey(socket: msgSocket, pane: msgPane) {
+                    convByTmuxPane[paneKey] = convId
+                } else if let agentPid = resolvedAgentPid,
+                          let agent = AgentProcessScanner.liveCLIAgents().first(where: { $0.pid == agentPid }),
+                          let paneKey = AgentProcessScanner.tmuxPaneKey(socket: agent.tmuxSocket, pane: agent.tmuxPane) {
+                    convByTmuxPane[paneKey] = convId
+                }
+            }
+
+            if source == .cli, let rawOverride = msg.autoCompactOverride {
+                let trimmed = rawOverride.trimmingCharacters(in: .whitespacesAndNewlines)
+                hookAutoCompactOverrideByConv[convId] = trimmed
+                activeHookAutoCompactOverrideBySource[source] = trimmed
+            }
         }
         if msg.event == "SessionStart" || msg.event == "PreInvocation" {
-            hookLastEventAt = eventDate
+            hookLastEventAtBySource[source] = eventDate
         }
 
         if !convId.isEmpty {
@@ -131,6 +286,9 @@ final class TranscriptMonitor {
         }
 
         scheduleTimer()
+        if source == .cli {
+            tmuxFocusMonitor.probeNow(force: true)
+        }
         refreshNow(scanConversations: true)
     }
 
@@ -147,6 +305,41 @@ final class TranscriptMonitor {
                 self?.refreshNow(scanConversations: false)
             }
         }
+        updateTmuxPollingState()
+    }
+
+    private func updateTmuxPollingState() {
+        guard state.isVisible,
+              state.pinnedConversationId == nil,
+              state.sourceMode != .desktop else {
+            tmuxFocusMonitor.setActive(false)
+            return
+        }
+        let trackingCLI = state.sourceMode == .cli
+            || focusSources.isEmpty
+            || focusSources.contains(.cli)
+        guard trackingCLI else {
+            tmuxFocusMonitor.setActive(false)
+            return
+        }
+        let hasTmuxAgents = AgentProcessScanner.liveCLIAgents().contains { $0.tmuxSocket != nil }
+        tmuxFocusMonitor.setActive(hasTmuxAgents)
+    }
+
+    private func handleTmuxSnapshotChanged() {
+        let agents = AgentProcessScanner.liveCLIAgents()
+        let selection = resolveFocusedTmuxSelection(agents: agents, allowRescan: true)
+        let nextKey = selection.map {
+            TmuxFocusKey(socket: $0.socket, paneId: $0.paneId, agentPid: $0.agent?.pid)
+        }
+        if let prev = lastObservedTmuxFocus, let next = nextKey, prev != next {
+            lastTmuxFocusChangedAt = Date()
+            if let pid = next.agentPid {
+                AgentProcessScanner.invalidateOpenHandlesCache(for: pid)
+            }
+        }
+        lastObservedTmuxFocus = nextKey
+        refreshNow(scanConversations: false)
     }
 
     func refreshNow(scanConversations: Bool) {
@@ -160,6 +353,9 @@ final class TranscriptMonitor {
         }
 
         let target = resolveTargetTranscript()
+        if state.activeSource != target.source {
+            state.activeSource = target.source
+        }
         if target.conversationId != activeConversationId || target.path != activePath {
             switchToTranscript(path: target.path, conversationId: target.conversationId)
         } else if !activePath.isEmpty {
@@ -172,46 +368,48 @@ final class TranscriptMonitor {
     // MARK: - Annotations (`last_user_view_time`) Tracking
 
     private func startAnnotationsDirWatch() {
-        guard annotationsDirSource == nil else { return }
-        let dirPath = AppPaths.annotationsDir.path
-        let fd = open(dirPath, O_EVTONLY)
-        guard fd >= 0 else { return }
-        annotationsDirFd = fd
+        for source in AgentSource.allCases where annotationWatches[source] == nil {
+            let fd = open(source.annotationsDir.path, O_EVTONLY)
+            guard fd >= 0 else { continue }
 
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fd,
-            eventMask: [.write, .extend, .rename],
-            queue: DispatchQueue.main
-        )
-        source.setEventHandler { [weak self] in
-            self?.refreshNow(scanConversations: false)
-        }
-        source.setCancelHandler { [weak self] in
-            guard let self else { return }
-            if self.annotationsDirFd >= 0 {
-                close(self.annotationsDirFd)
-                self.annotationsDirFd = -1
+            let watch = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: fd,
+                eventMask: [.write, .extend, .rename],
+                queue: DispatchQueue.main
+            )
+            watch.setEventHandler { [weak self] in
+                self?.refreshNow(scanConversations: false)
             }
+            watch.setCancelHandler {
+                close(fd)
+            }
+            annotationWatches[source] = watch
+            watch.resume()
         }
-        annotationsDirSource = source
-        source.resume()
     }
 
     private func stopAnnotationsDirWatch() {
-        annotationsDirSource?.cancel()
-        annotationsDirSource = nil
-        if annotationsDirFd >= 0 {
-            close(annotationsDirFd)
-            annotationsDirFd = -1
+        for watch in annotationWatches.values {
+            watch.cancel()
         }
+        annotationWatches.removeAll()
     }
 
     private func scanAnnotationsFast() {
+        var liveIds = Set<String>()
+        for source in AgentSource.allCases {
+            scanAnnotations(of: source, liveIds: &liveIds)
+        }
+        for oldKey in annotationCache.keys where !liveIds.contains(oldKey) {
+            annotationCache.removeValue(forKey: oldKey)
+        }
+    }
+
+    private func scanAnnotations(of source: AgentSource, liveIds: inout Set<String>) {
         let fm = FileManager.default
-        let dirPath = AppPaths.annotationsDir.path
+        let dirPath = source.annotationsDir.path
         guard let files = try? fm.contentsOfDirectory(atPath: dirPath) else { return }
 
-        var liveIds = Set<String>()
         for file in files where file.hasSuffix(".pbtxt") {
             let convId = String(file.dropLast(6))
             guard !convId.isEmpty else { continue }
@@ -233,6 +431,7 @@ final class TranscriptMonitor {
                 let viewTime = Self.parseLastUserViewTime(content)
                 let entry = AnnotationEntry(
                     conversationId: convId,
+                    source: source,
                     mtime: mtime,
                     title: parsedTitle,
                     lastUserViewTime: viewTime
@@ -246,14 +445,12 @@ final class TranscriptMonitor {
                 }
             }
         }
-
-        for oldKey in annotationCache.keys where !liveIds.contains(oldKey) {
-            annotationCache.removeValue(forKey: oldKey)
-        }
     }
 
+    /// Desktop only: the agy CLI never writes `last_user_view_time`.
     private func resolveMostRecentlyViewedConversation() -> (id: String, viewTime: Double)? {
-        guard let maxVt = annotationCache.values.compactMap(\.lastUserViewTime).max() else {
+        let desktopEntries = annotationCache.values.filter { $0.source == .desktop }
+        guard let maxVt = desktopEntries.compactMap(\.lastUserViewTime).max() else {
             return nil
         }
 
@@ -267,7 +464,7 @@ final class TranscriptMonitor {
         // Antigravity often writes the exact same `last_user_view_time` to both the conversation
         // the user just left AND the conversation the user just entered. Collect all tied entries
         // within 150ms of maxVt and exclude the currently active conversation to pick the destination.
-        let tied = annotationCache.values.filter { entry in
+        let tied = desktopEntries.filter { entry in
             guard let vt = entry.lastUserViewTime else { return false }
             return (maxVt - vt) <= 0.15
         }
@@ -388,105 +585,159 @@ final class TranscriptMonitor {
     // MARK: - Seed, Calibration, and Recent Conversations
 
     private func loadRuntimeStateSeed() {
-        guard let data = try? Data(contentsOf: AppPaths.runtimeStateURL),
-              let runtime = try? JSONDecoder().decode(RuntimeStateFile.self, from: data) else {
-            return
-        }
-        if let timings = runtime.timings {
-            hookTimingsByConv = timings
-        }
-        if let conv = runtime.activeConversationId, !conv.isEmpty {
-            hookActiveConvId = conv
-        }
-        if let model = runtime.activeModelName, !model.isEmpty {
-            hookActiveModel = model
-        }
-        if let ms = runtime.lastEventMs {
-            hookLastEventAt = Date(timeIntervalSince1970: ms / 1000.0)
-        }
-        if runtime.isGenerating == true,
-           !hookActiveConvId.isEmpty,
-           Date().timeIntervalSince(hookLastEventAt) < 120 {
-            generatingStartByConv[hookActiveConvId] = hookLastEventAt
+        for source in AgentSource.allCases {
+            guard let data = try? Data(contentsOf: source.runtimeStateURL),
+                  let runtime = try? JSONDecoder().decode(RuntimeStateFile.self, from: data) else {
+                continue
+            }
+            if let timings = runtime.timings {
+                for (convId, records) in timings {
+                    hookTimingsByConv[convId] = records
+                    sourceByConv[convId] = source
+                }
+            }
+            if let overrides = runtime.autoCompactOverrides {
+                for (convId, val) in overrides {
+                    hookAutoCompactOverrideByConv[convId] = val.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+            if source == .cli, let panes = runtime.tmuxPanes {
+                for (paneKey, convId) in panes where !paneKey.isEmpty && !convId.isEmpty {
+                    let parts = paneKey.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+                    if parts.count == 2,
+                       let normalizedKey = AgentProcessScanner.tmuxPaneKey(
+                           socket: String(parts[0]),
+                           pane: String(parts[1])
+                       ) {
+                        convByTmuxPane[normalizedKey] = convId
+                        sourceByConv[convId] = .cli
+                    }
+                }
+            }
+            if let activeOverride = runtime.activeAutoCompactOverride {
+                activeHookAutoCompactOverrideBySource[source] = activeOverride.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            let lastEventAt = runtime.lastEventMs.map { Date(timeIntervalSince1970: $0 / 1000.0) }
+            if let lastEventAt {
+                hookLastEventAtBySource[source] = lastEventAt
+            }
+            guard let conv = runtime.activeConversationId, !conv.isEmpty else { continue }
+            hookActiveConvBySource[source] = conv
+            sourceByConv[conv] = source
+            if let model = runtime.activeModelName, !model.isEmpty {
+                hookModelByConv[conv] = model
+            }
+            if runtime.isGenerating == true, let lastEventAt,
+               Date().timeIntervalSince(lastEventAt) < 120 {
+                generatingStartByConv[conv] = lastEventAt
+            }
         }
     }
 
     private func calibrateCompactionThresholdsAsync() {
-        let brainPath = AppPaths.brainDir.path
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let fm = FileManager.default
-            guard let entries = try? fm.contentsOfDirectory(atPath: brainPath) else { return }
-
-            var filesWithMtime: [(String, Date)] = []
-            for entry in entries {
-                let tPath = "\(brainPath)/\(entry)/.system_generated/logs/transcript.jsonl"
-                if let attrs = try? fm.attributesOfItem(atPath: tPath),
-                   let mtime = attrs[.modificationDate] as? Date {
-                    filesWithMtime.append((tPath, mtime))
+            var calibrated: [AgentSource: [String: Int]] = [:]
+            for source in AgentSource.allCases {
+                let medians = Self.calibrateThresholds(brainPath: source.brainDir.path)
+                if !medians.isEmpty {
+                    calibrated[source] = medians
                 }
             }
-            filesWithMtime.sort { $0.1 > $1.1 }
 
-            var samplesByFamily: [String: [Int]] = [:]
-            for (path, _) in filesWithMtime.prefix(25) {
-                guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
-                var lastModel = ""
-                var lastCtx = 0
-                for line in content.split(separator: "\n") {
-                    guard let d = line.data(using: .utf8),
-                          let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                          let type = obj["type"] as? String else { continue }
-                    if type == "PLANNER_RESPONSE" {
-                        if let m = obj["model"] as? String, !m.isEmpty {
-                            lastModel = m
-                        }
-                        let inp = (obj["input_tokens"] as? Int) ?? 0
-                        let cache = (obj["cache_read_tokens"] as? Int) ?? 0
-                        lastCtx = inp + cache
-                    } else if type == "CHECKPOINT" {
-                        let inp = (obj["input_tokens"] as? Int) ?? 0
-                        let cache = (obj["cache_read_tokens"] as? Int) ?? 0
-                        let ckptCtx = inp + cache
-                        let pre = max(ckptCtx, lastCtx)
-                        if pre > 20_000 && !lastModel.isEmpty {
+            Task { @MainActor [weak self] in
+                guard let self, !calibrated.isEmpty else { return }
+                self.observedThresholds = calibrated
+                self.recomputeMetrics()
+            }
+        }
+    }
+
+    /// Median pre-compaction context per model family, from recent CHECKPOINT history.
+    private nonisolated static func calibrateThresholds(brainPath: String) -> [String: Int] {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: brainPath) else { return [:] }
+
+        var filesWithMtime: [(String, Date)] = []
+        for entry in entries {
+            let tPath = "\(brainPath)/\(entry)/.system_generated/logs/transcript.jsonl"
+            if let attrs = try? fm.attributesOfItem(atPath: tPath),
+               let mtime = attrs[.modificationDate] as? Date {
+                filesWithMtime.append((tPath, mtime))
+            }
+        }
+        filesWithMtime.sort { $0.1 > $1.1 }
+
+        var samplesByFamily: [String: [Int]] = [:]
+        for (path, _) in filesWithMtime.prefix(25) {
+            guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            var lastModel = ""
+            var lastCtx = 0
+            for line in content.split(separator: "\n") {
+                guard let d = line.data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                      let type = obj["type"] as? String else { continue }
+                if type == "PLANNER_RESPONSE" {
+                    if let m = obj["model"] as? String, !m.isEmpty {
+                        lastModel = m
+                    }
+                    let inp = (obj["input_tokens"] as? Int) ?? 0
+                    let cache = (obj["cache_read_tokens"] as? Int) ?? 0
+                    lastCtx = inp + cache
+                } else if type == "CHECKPOINT" {
+                    let inp = (obj["input_tokens"] as? Int) ?? 0
+                    let cache = (obj["cache_read_tokens"] as? Int) ?? 0
+                    let ckptCtx = inp + cache
+                    let pre = max(ckptCtx, lastCtx)
+                    if pre > 20_000 && !lastModel.isEmpty {
+                        let maxWindow = ModelCatalog.spec(for: lastModel, observedThresholds: [:]).contextWindow
+                        if pre <= maxWindow {
                             let fam = ModelCatalog.familyKey(for: lastModel)
                             samplesByFamily[fam, default: []].append(pre)
                         }
                     }
                 }
             }
-
-            var medians: [String: Int] = [:]
-            for (fam, values) in samplesByFamily where !values.isEmpty {
-                let sorted = values.sorted()
-                medians[fam] = sorted[sorted.count / 2]
-            }
-
-            Task { @MainActor [weak self] in
-                guard let self, !medians.isEmpty else { return }
-                self.observedThresholds = medians
-                self.recomputeMetrics()
-            }
         }
+
+        var medians: [String: Int] = [:]
+        for (fam, values) in samplesByFamily where !values.isEmpty {
+            let sorted = values.sorted()
+            medians[fam] = sorted[sorted.count / 2]
+        }
+        return medians
     }
 
     private func refreshRecentConversations() {
         let fm = FileManager.default
-        let brainPath = AppPaths.brainDir.path
-        guard let dirs = try? fm.contentsOfDirectory(atPath: brainPath) else { return }
+        var candidates: [ConversationCandidate] = []
+        var newest: [AgentSource: (id: String, path: String, mtime: Date)] = [:]
 
-        var candidates: [(id: String, path: String, sortTime: Date)] = []
-        for dir in dirs {
-            let tPath = "\(brainPath)/\(dir)/.system_generated/logs/transcript.jsonl"
-            guard let attrs = try? fm.attributesOfItem(atPath: tPath),
-                  let mtime = attrs[.modificationDate] as? Date else {
-                continue
+        for source in AgentSource.allCases {
+            let brainPath = source.brainDir.path
+            guard let dirs = try? fm.contentsOfDirectory(atPath: brainPath) else { continue }
+            for dir in dirs {
+                // The CLI also keeps subagent runs under brain/. Only conversations the
+                // user opened get an annotation file, fire hooks, or are locked by a live agy.
+                if source == .cli, annotationCache[dir] == nil, hookTimingsByConv[dir] == nil,
+                   hookActiveConvBySource[.cli] != dir, agentPidByConv[dir] == nil {
+                    continue
+                }
+                let tPath = "\(brainPath)/\(dir)/.system_generated/logs/transcript.jsonl"
+                guard let attrs = try? fm.attributesOfItem(atPath: tPath),
+                      let mtime = attrs[.modificationDate] as? Date else {
+                    continue
+                }
+                sourceByConv[dir] = source
+                if mtime > (newest[source]?.mtime ?? .distantPast) {
+                    newest[source] = (dir, tPath, mtime)
+                }
+                let viewDate = annotationCache[dir]?.lastUserViewTime.map { Date(timeIntervalSince1970: $0) }
+                let sortTime = viewDate.map { max($0, mtime) } ?? mtime
+                candidates.append(ConversationCandidate(id: dir, path: tPath, sortTime: sortTime, source: source))
             }
-            let viewDate = annotationCache[dir]?.lastUserViewTime.map { Date(timeIntervalSince1970: $0) }
-            let sortTime = viewDate.map { max($0, mtime) } ?? mtime
-            candidates.append((dir, tPath, sortTime))
         }
         candidates.sort { $0.sortTime > $1.sortTime }
+        newestTranscriptBySource = newest
 
         if Date().timeIntervalSince(lastTitleFetchAt) > 30,
            quotaClient?.hasLiveCredentials == true {
@@ -503,9 +754,9 @@ final class TranscriptMonitor {
         updateConversationChoices(candidates: candidates)
     }
 
-    private func updateConversationChoices(candidates: [(id: String, path: String, sortTime: Date)]) {
+    private func updateConversationChoices(candidates: [ConversationCandidate]) {
         var choices: [ConversationChoice] = []
-        for item in candidates.prefix(8) {
+        for item in candidates.prefix(10) {
             let title = cachedTitles[item.id]
                 ?? annotationCache[item.id]?.title
                 ?? extractTitleFromTranscriptHead(path: item.path)
@@ -515,7 +766,8 @@ final class TranscriptMonitor {
                 title: title,
                 updatedAt: item.sortTime,
                 transcriptPath: item.path,
-                modelId: nil
+                modelId: nil,
+                source: item.source
             ))
         }
         state.recentConversations = choices
@@ -549,62 +801,395 @@ final class TranscriptMonitor {
     }
 
     private func transcriptPath(for conversationId: String) -> String {
-        let compact = AppPaths.brainDir
-            .appendingPathComponent(conversationId)
-            .appendingPathComponent(".system_generated/logs/transcript.jsonl").path
-        if FileManager.default.fileExists(atPath: compact) {
-            return compact
+        var order = AgentSource.allCases
+        if let known = sourceByConv[conversationId] {
+            order = [known] + order.filter { $0 != known }
         }
-        let full = AppPaths.brainDir
-            .appendingPathComponent(conversationId)
-            .appendingPathComponent(".system_generated/logs/transcript_full.jsonl").path
-        if FileManager.default.fileExists(atPath: full) {
-            return full
+        for source in order {
+            let logsDir = source.brainDir
+                .appendingPathComponent(conversationId)
+                .appendingPathComponent(".system_generated/logs")
+            for name in ["transcript.jsonl", "transcript_full.jsonl"] {
+                let path = logsDir.appendingPathComponent(name).path
+                if FileManager.default.fileExists(atPath: path) {
+                    sourceByConv[conversationId] = source
+                    return path
+                }
+            }
         }
         return ""
     }
 
-    private func resolveTargetTranscript() -> (path: String, conversationId: String) {
+    /// Which front end to display when no conversation is pinned.
+    private func resolveActiveSource() -> AgentSource {
+        if let forced = state.sourceMode {
+            return forced
+        }
+        if focusSources.count == 1, let only = focusSources.first {
+            return only
+        }
+        // No host window has been frontmost yet, or one app shows both (agy running in
+        // Antigravity's own terminal): follow whichever was used last.
+        return lastActivity(of: .cli) > lastActivity(of: .desktop) ? .cli : .desktop
+    }
+
+    private func lastActivity(of source: AgentSource) -> Date {
+        var latest = max(
+            hookLastEventAtBySource[source] ?? .distantPast,
+            newestTranscriptBySource[source]?.mtime ?? .distantPast
+        )
+        if source == .cli {
+            latest = max(latest, lastTmuxFocusChangedAt)
+        }
+        if source == .desktop,
+           let viewed = annotationCache.values
+               .filter({ $0.source == .desktop })
+               .compactMap(\.lastUserViewTime).max() {
+            latest = max(latest, Date(timeIntervalSince1970: viewed))
+        }
+        return latest
+    }
+
+    private func resolveTargetTranscript() -> (path: String, conversationId: String, source: AgentSource) {
         // 1. User manually pinned a specific conversation in the Menu Bar
         if let pinned = state.pinnedConversationId, !pinned.isEmpty {
-            return (transcriptPath(for: pinned), pinned)
+            let path = transcriptPath(for: pinned)
+            return (path, pinned, sourceByConv[pinned] ?? resolveActiveSource())
         }
 
-        // 2. Primary source: Antigravity's `annotations/<id>.pbtxt` `last_user_view_time`
+        let source = resolveActiveSource()
+        let target = source == .cli ? resolveCLITarget() : resolveDesktopTarget()
+        return (target.path, target.conversationId, source)
+    }
+
+    private func resolveDesktopTarget() -> (path: String, conversationId: String) {
+        let hookConvId = hookActiveConvBySource[.desktop] ?? ""
+
+        // Primary source: Antigravity's `annotations/<id>.pbtxt` `last_user_view_time`
         if let viewed = resolveMostRecentlyViewedConversation() {
             // Only prefer a brand-new hook conversation if it has no annotation view time yet
             // AND started strictly after the last viewed conversation.
-            if !hookActiveConvId.isEmpty,
-               hookActiveConvId != viewed.id,
-               annotationCache[hookActiveConvId]?.lastUserViewTime == nil,
-               hookLastEventAt.timeIntervalSince1970 > viewed.viewTime {
-                return (transcriptPath(for: hookActiveConvId), hookActiveConvId)
+            if !hookConvId.isEmpty,
+               hookConvId != viewed.id,
+               annotationCache[hookConvId]?.lastUserViewTime == nil,
+               (hookLastEventAtBySource[.desktop] ?? .distantPast).timeIntervalSince1970 > viewed.viewTime {
+                return (transcriptPath(for: hookConvId), hookConvId)
             }
             return (transcriptPath(for: viewed.id), viewed.id)
         }
 
-        // 3. Fallback when no annotation files exist yet
-        if !hookActiveConvId.isEmpty {
-            return (transcriptPath(for: hookActiveConvId), hookActiveConvId)
+        // Fallback when no annotation files exist yet
+        if !hookConvId.isEmpty {
+            return (transcriptPath(for: hookConvId), hookConvId)
         }
-        if let newest = state.recentConversations.first {
-            return (newest.transcriptPath, newest.id)
+        if let newest = newestTranscriptBySource[.desktop] {
+            return (newest.path, newest.id)
         }
         return ("", "")
+    }
+
+    /// Resolves the active CLI session:
+    /// 1. Live `agy` in the focused tmux pane / window / session (prevents background tasks from hijacking).
+    /// 2. Live non-tmux `agy` hosted by the frontmost terminal app.
+    /// 3. Most recent CLI hook or transcript on disk.
+    private func resolveCLITarget() -> (path: String, conversationId: String) {
+        let agents = AgentProcessScanner.liveCLIAgents()
+
+        if let focused = resolveFocusedTmuxSelection(agents: agents, allowRescan: false),
+           let agent = focused.agent,
+           let convId = resolveConversationId(for: agent) {
+            recordLiveAgentLink(agent: agent, conversationId: convId, paneIdOverride: focused.paneId)
+            return (transcriptPath(for: convId), convId)
+        }
+
+        if let hostPid = focusHostPid {
+            let nonTmuxInHost = agents.filter { $0.tmuxSocket == nil && $0.hostPids.contains(hostPid) }
+            if let chosen = pickPreferredAgent(from: nonTmuxInHost),
+               let convId = resolveConversationId(for: chosen) {
+                recordLiveAgentLink(agent: chosen, conversationId: convId, paneIdOverride: nil)
+                return (transcriptPath(for: convId), convId)
+            }
+        }
+
+        if let hookConvId = hookActiveConvBySource[.cli], !hookConvId.isEmpty {
+            let path = transcriptPath(for: hookConvId)
+            let startedJustNow = Date().timeIntervalSince(hookLastEventAtBySource[.cli] ?? .distantPast) < 60
+            // A new session fires SessionStart before its transcript file exists.
+            if !path.isEmpty || startedJustNow {
+                return (path, hookConvId)
+            }
+        }
+        if let newest = newestTranscriptBySource[.cli] {
+            return (newest.path, newest.id)
+        }
+        return ("", "")
+    }
+
+    private func recordLiveAgentLink(agent: AgentProcessScanner.CLIAgent, conversationId: String, paneIdOverride: String?) {
+        sourceByConv[conversationId] = .cli
+        agentPidByConv[conversationId] = agent.pid
+        if let paneKey = AgentProcessScanner.tmuxPaneKey(socket: agent.tmuxSocket, pane: paneIdOverride ?? agent.tmuxPane) {
+            convByTmuxPane[paneKey] = conversationId
+        }
+    }
+
+    private func resolveFocusedTmuxSelection(
+        agents: [AgentProcessScanner.CLIAgent],
+        allowRescan: Bool
+    ) -> FocusedTmuxSelection? {
+        var currentAgents = agents
+        var tmuxAgents = currentAgents.filter { $0.tmuxSocket != nil }
+
+        // Optional instant IPC push hint (e.g. from tmux after-select-pane hook).
+        if let hint = ipcTmuxFocusHint {
+            if Date().timeIntervalSince(hint.receivedAt) <= 0.4 {
+                let serverAgents = tmuxAgents.filter { $0.tmuxSocket == hint.socket }
+                if let matched = pickPreferredAgent(from: serverAgents.filter { $0.tmuxPane == hint.paneId }) {
+                    return FocusedTmuxSelection(socket: hint.socket, paneId: hint.paneId, agent: matched)
+                }
+            } else {
+                ipcTmuxFocusHint = nil
+            }
+        }
+
+        guard !tmuxAgents.isEmpty else { return nil }
+        let liveSockets = Set(tmuxAgents.compactMap(\.tmuxSocket))
+        let allClients: [(snapshot: TmuxServerSnapshot, client: TmuxClientInfo)] = tmuxFocusMonitor.snapshots.values
+            .filter { liveSockets.contains($0.socket) }
+            .flatMap { snap in snap.clients.map { (snap, $0) } }
+        guard !allClients.isEmpty else { return nil }
+
+        let chosenPair: (snapshot: TmuxServerSnapshot, client: TmuxClientInfo)?
+        if let hostPid = focusHostPid {
+            let hostMatches = allClients.filter {
+                AgentProcessScanner.hostAppPid(of: $0.client.clientPid) == hostPid
+            }
+            if !hostMatches.isEmpty {
+                chosenPair = bestTmuxClient(from: hostMatches)
+            } else {
+                let hasNonTmuxInFrontHost = currentAgents.contains {
+                    $0.tmuxSocket == nil && $0.hostPids.contains(hostPid)
+                }
+                if hasNonTmuxInFrontHost {
+                    return nil
+                }
+                chosenPair = bestTmuxClient(from: allClients)
+            }
+        } else {
+            chosenPair = bestTmuxClient(from: allClients)
+        }
+
+        guard let (snapshot, activeClient) = chosenPair else { return nil }
+
+        var serverAgents = tmuxAgents.filter { $0.tmuxSocket == snapshot.socket }
+
+        // Priority 1: Focused tmux pane.
+        var activePaneAgents = matchingAgents(
+            paneId: activeClient.paneId,
+            panePid: activeClient.panePid,
+            in: serverAgents
+        )
+        if activePaneAgents.isEmpty && allowRescan {
+            let paneKey = "\(snapshot.socket)|\(activeClient.paneId)"
+            let now = Date()
+            if paneKey != lastUnmatchedPaneRescanKey && now.timeIntervalSince(lastUnmatchedPaneRescanAt) >= 0.5 {
+                lastUnmatchedPaneRescanKey = paneKey
+                lastUnmatchedPaneRescanAt = now
+                AgentProcessScanner.invalidateCache()
+                currentAgents = AgentProcessScanner.liveCLIAgents(maxAge: 0)
+                tmuxAgents = currentAgents.filter { $0.tmuxSocket != nil }
+                serverAgents = tmuxAgents.filter { $0.tmuxSocket == snapshot.socket }
+                activePaneAgents = matchingAgents(
+                    paneId: activeClient.paneId,
+                    panePid: activeClient.panePid,
+                    in: serverAgents
+                )
+            }
+        }
+        if let chosen = pickPreferredAgent(from: activePaneAgents) {
+            return FocusedTmuxSelection(socket: snapshot.socket, paneId: activeClient.paneId, agent: chosen)
+        }
+
+        // Priority 2: Companion `agy` pane in the same active tmux window (e.g. when a sidebar
+        // pane like tmux-arbor or a shell split in the same window is temporarily focused).
+        let windowPanes = snapshot.panes.filter {
+            $0.sessionId == activeClient.sessionId && $0.windowId == activeClient.windowId
+        }
+        let windowMatches: [(pane: TmuxPaneInfo, agent: AgentProcessScanner.CLIAgent)] = windowPanes.flatMap { pane in
+            matchingAgents(paneId: pane.paneId, panePid: pane.panePid, in: serverAgents).map { (pane, $0) }
+        }
+        if let chosen = pickPreferredPaneAgent(from: windowMatches) {
+            return FocusedTmuxSelection(socket: snapshot.socket, paneId: chosen.pane.paneId, agent: chosen.agent)
+        }
+
+        // Priority 3: `agy` pane in the same active tmux session.
+        let sessionPanes = snapshot.panes.filter { $0.sessionId == activeClient.sessionId }
+        let sessionMatches: [(pane: TmuxPaneInfo, agent: AgentProcessScanner.CLIAgent)] = sessionPanes.flatMap { pane in
+            matchingAgents(paneId: pane.paneId, panePid: pane.panePid, in: serverAgents).map { (pane, $0) }
+        }
+        if let chosen = pickPreferredPaneAgent(from: sessionMatches) {
+            return FocusedTmuxSelection(socket: snapshot.socket, paneId: chosen.pane.paneId, agent: chosen.agent)
+        }
+
+        return FocusedTmuxSelection(socket: snapshot.socket, paneId: activeClient.paneId, agent: nil)
+    }
+
+    private func bestTmuxClient(
+        from candidates: [(snapshot: TmuxServerSnapshot, client: TmuxClientInfo)]
+    ) -> (snapshot: TmuxServerSnapshot, client: TmuxClientInfo)? {
+        candidates.max { lhs, rhs in
+            if lhs.client.isFocused != rhs.client.isFocused {
+                return !lhs.client.isFocused && rhs.client.isFocused
+            }
+            if lhs.client.activity != rhs.client.activity {
+                return lhs.client.activity < rhs.client.activity
+            }
+            return lhs.client.clientPid < rhs.client.clientPid
+        }
+    }
+
+    private func matchingAgents(
+        paneId: String,
+        panePid: pid_t,
+        in serverAgents: [AgentProcessScanner.CLIAgent]
+    ) -> [AgentProcessScanner.CLIAgent] {
+        serverAgents.filter { agent in
+            if let agentPane = agent.tmuxPane, agentPane == paneId {
+                return true
+            }
+            return panePid > 1 && AgentProcessScanner.isDescendant(agent.pid, of: panePid)
+        }
+    }
+
+    private func pickPreferredAgent(
+        from agents: [AgentProcessScanner.CLIAgent]
+    ) -> AgentProcessScanner.CLIAgent? {
+        guard !agents.isEmpty else { return nil }
+        if agents.count == 1 { return agents[0] }
+        return agents.max { lhs, rhs in
+            agentActivityRank(lhs) < agentActivityRank(rhs)
+        }
+    }
+
+    private func pickPreferredPaneAgent(
+        from pairs: [(pane: TmuxPaneInfo, agent: AgentProcessScanner.CLIAgent)]
+    ) -> (pane: TmuxPaneInfo, agent: AgentProcessScanner.CLIAgent)? {
+        guard !pairs.isEmpty else { return nil }
+        if pairs.count == 1 { return pairs[0] }
+        return pairs.max { lhs, rhs in
+            let lScore = agentActivityRank(lhs.agent)
+            let rScore = agentActivityRank(rhs.agent)
+            if lScore != rScore {
+                return lScore < rScore
+            }
+            if lhs.pane.isActive != rhs.pane.isActive {
+                return !lhs.pane.isActive && rhs.pane.isActive
+            }
+            return lhs.agent.pid < rhs.agent.pid
+        }
+    }
+
+    private func agentActivityRank(_ agent: AgentProcessScanner.CLIAgent) -> (Int, TimeInterval) {
+        let convId = resolveConversationId(for: agent)
+        let isCurrentlyDisplayed = (convId != nil && convId == activeConversationId) ? 1 : 0
+        let hookTime = convByAgentPid[agent.pid]?.updatedAt.timeIntervalSince1970 ?? 0
+        let mtime = convId.map { transcriptMtime(for: $0) } ?? 0
+        return (isCurrentlyDisplayed, max(hookTime, mtime))
+    }
+
+    private func resolveConversationId(for agent: AgentProcessScanner.CLIAgent) -> String? {
+        let hookLink = convByAgentPid[agent.pid]
+        let handles = AgentProcessScanner.openConversationHandles(for: agent.pid)
+
+        // During the brief startup window right after SessionStart, prefer the hook's
+        // new conversation ID if the process hasn't opened its lock file yet.
+        if let hookLink, hookLink.fromSessionStart,
+           Date().timeIntervalSince(hookLink.updatedAt) < 2.0,
+           handles.lockIds.isEmpty {
+            return hookLink.conversationId
+        }
+
+        let preferred: Set<String>
+        if !handles.lockIds.isEmpty {
+            preferred = handles.lockIds
+        } else if !handles.dbIds.isEmpty {
+            preferred = handles.dbIds
+        } else {
+            preferred = handles.brainIds
+        }
+
+        if !preferred.isEmpty {
+            if preferred.count == 1, let only = preferred.first {
+                return only
+            }
+            if let hookConv = hookLink?.conversationId, preferred.contains(hookConv) {
+                return hookConv
+            }
+            return preferred.max { lhs, rhs in
+                let lm = transcriptMtime(for: lhs)
+                let rm = transcriptMtime(for: rhs)
+                if lm != rm { return lm < rm }
+                return lhs > rhs
+            }
+        }
+
+        if let hookConv = hookLink?.conversationId, !hookConv.isEmpty {
+            return hookConv
+        }
+        if let paneKey = AgentProcessScanner.tmuxPaneKey(socket: agent.tmuxSocket, pane: agent.tmuxPane),
+           let paneConv = convByTmuxPane[paneKey], !paneConv.isEmpty {
+            return paneConv
+        }
+        return nil
     }
 
     // MARK: - Transcript Reading & VNODE Watch
 
     private func switchToTranscript(path: String, conversationId: String) {
+        let isSameTarget = (conversationId == activeConversationId && path == activePath)
+        if isSameTarget {
+            // Re-open after rename/delete: discard cached state so the file is re-read cleanly.
+            transcriptCache.removeValue(forKey: conversationId)
+        } else if !activeConversationId.isEmpty, !activePath.isEmpty {
+            transcriptCache[activeConversationId] = CachedTranscript(
+                path: activePath,
+                inode: activeInode,
+                readOffset: readOffset,
+                lineRemainder: lineRemainder,
+                parsedSteps: parsedSteps,
+                lastUsedAt: Date()
+            )
+            if transcriptCache.count > 16 {
+                let oldestKeys = transcriptCache
+                    .sorted { $0.value.lastUsedAt > $1.value.lastUsedAt }
+                    .dropFirst(16)
+                    .map(\.key)
+                for key in oldestKeys {
+                    transcriptCache.removeValue(forKey: key)
+                }
+            }
+        }
+
         stopVnodeWatch()
         activePath = path
         activeConversationId = conversationId
-        activeInode = 0
-        readOffset = 0
-        lineRemainder = ""
-        parsedSteps = []
+
+        if !isSameTarget, !path.isEmpty,
+           let cached = transcriptCache[conversationId], cached.path == path {
+            activeInode = cached.inode
+            readOffset = cached.readOffset
+            lineRemainder = cached.lineRemainder
+            parsedSteps = cached.parsedSteps
+            transcriptCache[conversationId]?.lastUsedAt = Date()
+        } else {
+            activeInode = 0
+            readOffset = 0
+            lineRemainder = ""
+            parsedSteps = []
+        }
 
         state.conversationId = conversationId
+        NSLog("[AgyHUD] tracking %@ conversation %@", state.activeSource.rawValue, conversationId.isEmpty ? "(none)" : conversationId)
         if !conversationId.isEmpty {
             if let cached = cachedTitles[conversationId] ?? annotationCache[conversationId]?.title {
                 cachedTitles[conversationId] = cached
@@ -628,7 +1213,6 @@ final class TranscriptMonitor {
         stopVnodeWatch()
         let fd = open(path, O_EVTONLY)
         guard fd >= 0 else { return }
-        vnodeFd = fd
 
         let source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fd,
@@ -645,12 +1229,8 @@ final class TranscriptMonitor {
             }
             self.recomputeMetrics()
         }
-        source.setCancelHandler { [weak self] in
-            guard let self else { return }
-            if self.vnodeFd >= 0 {
-                close(self.vnodeFd)
-                self.vnodeFd = -1
-            }
+        source.setCancelHandler {
+            close(fd)
         }
         vnodeSource = source
         source.resume()
@@ -659,10 +1239,6 @@ final class TranscriptMonitor {
     private func stopVnodeWatch() {
         vnodeSource?.cancel()
         vnodeSource = nil
-        if vnodeFd >= 0 {
-            close(vnodeFd)
-            vnodeFd = -1
-        }
     }
 
     private func readAppendedBytes(liveArrivalMs: Double?) {
@@ -761,7 +1337,8 @@ final class TranscriptMonitor {
     private func recomputeMetrics() {
         // Per-conversation generating indicator
         if let started = generatingStartByConv[activeConversationId] {
-            if Date().timeIntervalSince(started) > 180 {
+            let agentExited = agentPidByConv[activeConversationId].map { !AgentProcessScanner.isAlive($0) } ?? false
+            if Date().timeIntervalSince(started) > 180 || agentExited {
                 generatingStartByConv.removeValue(forKey: activeConversationId)
                 state.isGenerating = false
                 state.generatingStartedAt = nil
@@ -780,19 +1357,30 @@ final class TranscriptMonitor {
         let resolvedModelId: String
         if let m = latestPlanner?.model, !m.isEmpty {
             resolvedModelId = m
-        } else if activeConversationId == hookActiveConvId, !hookActiveModel.isEmpty {
-            resolvedModelId = hookActiveModel
+        } else if let hookModel = hookModelByConv[activeConversationId], !hookModel.isEmpty {
+            resolvedModelId = hookModel
         } else {
             resolvedModelId = ""
         }
 
         let modelChanged = (resolvedModelId != state.modelId)
         state.modelId = resolvedModelId
-        let spec = ModelCatalog.spec(for: resolvedModelId, observedThresholds: observedThresholds)
+        let calibrated = observedThresholds[state.activeSource] ?? [:]
+        let spec = ModelCatalog.spec(for: resolvedModelId, observedThresholds: calibrated)
         state.modelDisplayName = spec.displayName
         state.contextWindow = spec.contextWindow
-        state.compactionThreshold = spec.defaultThreshold
-        state.thresholdSource = observedThresholds[spec.familyKey] != nil ? "calibrated" : "default"
+
+        if state.activeSource == .cli,
+           let rawOverride = resolveCLIAutoCompactOverride(for: activeConversationId),
+           let overrideTokens = ModelCatalog.parseAutoCompactOverride(rawOverride, contextWindow: spec.contextWindow) {
+            state.compactionThreshold = overrideTokens
+            state.thresholdSource = "override"
+            state.thresholdOverrideLabel = rawOverride
+        } else {
+            state.compactionThreshold = spec.defaultThreshold
+            state.thresholdSource = calibrated[spec.familyKey] != nil ? "calibrated" : "default"
+            state.thresholdOverrideLabel = nil
+        }
 
         if modelChanged {
             quotaClient?.regroupForActiveModel()
@@ -929,5 +1517,24 @@ final class TranscriptMonitor {
             state.peakTps = nil
             state.recentTps = []
         }
+    }
+
+    private func resolveCLIAutoCompactOverride(for convId: String) -> String? {
+        if !convId.isEmpty, let pid = agentPidByConv[convId] {
+            let live = AgentProcessScanner.autoCompactOverride(for: pid)
+            if live.found {
+                return live.value
+            }
+        }
+        if !convId.isEmpty, let fromHook = hookAutoCompactOverrideByConv[convId] {
+            return fromHook.isEmpty ? nil : fromHook
+        }
+        if let fromLiveProcess = AgentProcessScanner.fallbackAutoCompactOverride() {
+            return fromLiveProcess
+        }
+        if let active = activeHookAutoCompactOverrideBySource[.cli], !active.isEmpty {
+            return active
+        }
+        return nil
     }
 }

@@ -15,7 +15,7 @@ final class HUDPanel: NSPanel {
     var onDragStateChanged: ((Bool) -> Void)?
     var constrainOrigin: ((NSPoint, NSSize) -> NSPoint)?
 
-    init<Content: View>(rootView: Content, cornerRadius: CGFloat = 14) {
+    init<Content: View>(rootView: Content, cornerRadius: CGFloat = 14, theme: HUDTheme = .dark) {
         self.currentRadius = cornerRadius
         self.rootContainer = NSView(frame: NSRect(x: 0, y: 0, width: 272, height: 320))
         self.effectView = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 272, height: 320))
@@ -70,6 +70,23 @@ final class HUDPanel: NSPanel {
 
         self.hostingView = hosting
         self.contentView = rootContainer
+        applyTheme(theme)
+        invalidateShadow()
+    }
+
+    func applyTheme(_ theme: HUDTheme) {
+        switch theme {
+        case .dark:
+            self.appearance = NSAppearance(named: .darkAqua)
+            effectView.material = .hudWindow
+        case .light:
+            self.appearance = NSAppearance(named: .aqua)
+            effectView.material = .popover
+        case .system:
+            self.appearance = nil
+            let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            effectView.material = isDark ? .hudWindow : .popover
+        }
         invalidateShadow()
     }
 

@@ -47,7 +47,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         )
 
-        let hudPanel = HUDPanel(rootView: rootView, cornerRadius: hudState.isMiniPill ? 17 : 14)
+        let hudPanel = HUDPanel(
+            rootView: rootView,
+            cornerRadius: hudState.isMiniPill ? 17 : 14,
+            theme: hudState.theme
+        )
         self.panel = hudPanel
 
         let tracker = WindowTracker(state: hudState, panel: hudPanel, monitor: transcriptMonitor)
@@ -58,6 +62,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hudPanel.constrainOrigin = { [weak tracker] origin, size in
             tracker?.clampOrigin(origin, size: size) ?? origin
         }
+
+        hudState.$theme
+            .receive(on: DispatchQueue.main)
+            .sink { [weak hudPanel] theme in
+                hudPanel?.applyTheme(theme)
+            }
+            .store(in: &cancellables)
 
         hudState.$isMiniPill
             .receive(on: DispatchQueue.main)

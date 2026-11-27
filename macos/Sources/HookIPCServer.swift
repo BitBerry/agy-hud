@@ -120,6 +120,14 @@ final class HookIPCServer {
     private func handleClient(_ clientFd: Int32) {
         defer { close(clientFd) }
 
+        // An accepted socket inherits O_NONBLOCK from the listener. Left that way, a
+        // read that runs before the hook's payload lands returns EAGAIN and the
+        // message is dropped, so switch to blocking reads bounded by the timeout below.
+        let flags = fcntl(clientFd, F_GETFL, 0)
+        if flags >= 0 {
+            _ = fcntl(clientFd, F_SETFL, flags & ~O_NONBLOCK)
+        }
+
         var tv = timeval(tv_sec: 0, tv_usec: 150_000)
         setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 

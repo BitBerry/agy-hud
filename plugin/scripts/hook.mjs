@@ -14,11 +14,35 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Antigravity desktop and the agy CLI load this same plugin but hand it different
+// PLUGIN_DATA dirs (~/.gemini/antigravity/... vs ~/.gemini/antigravity-cli/...).
+// AgyHUD.app, its socket, prefs and quota cache live in exactly one place, so
+// everything that talks to the app uses HUD_HOME; only the per-host
+// runtime-state.json stays in PLUGIN_DATA.
+const HUD_HOME =
+  process.env.AGY_HUD_HOME ||
+  path.join(os.homedir(), '.gemini', 'antigravity', 'plugin_data', 'agy-hud');
+
 function resolveDataDir() {
-  return (
-    process.env.PLUGIN_DATA ||
-    path.join(os.homedir(), '.gemini', 'antigravity', 'plugin_data', 'agy-hud')
-  );
+  return process.env.PLUGIN_DATA || HUD_HOME;
+}
+
+function detectSource(dataDir, transcriptPath) {
+  const marker = `${path.sep}antigravity-cli${path.sep}`;
+  return dataDir.includes(marker) || transcriptPath.includes(marker) ? 'cli' : 'desktop';
+}
+
+function parseTmuxSocket(rawTmux) {
+  const value = String(rawTmux || '').trim();
+  if (!value) return '';
+  const parts = value.split(',');
+  const socketPath = parts.length >= 3 ? parts.slice(0, -2).join(',') : parts[0];
+  if (!socketPath) return '';
+  try {
+    return fs.realpathSync(socketPath);
+  } catch {
+    return socketPath;
+  }
 }
 
 function readStdinSync() {
@@ -88,15 +112,15 @@ function sendSocketIPC(sockPath, payload) {
   });
 }
 
-function maybeLaunchApp(dataDir) {
+function maybeLaunchApp() {
   try {
-    const prefs = safeReadJson(path.join(dataDir, 'prefs.json'));
-    if (prefs && prefs.autoLaunch === false) return;
+    const prefs = safeReadJson(path.join(HUD_HOME, 'prefs.json'));
+    if (!prefs || prefs.autoLaunch !== true) return;
 
-    const appPath = path.join(dataDir, 'AgyHUD.app');
+    const appPath = path.join(HUD_HOME, 'AgyHUD.app');
     if (!fs.existsSync(appPath)) return;
 
-    const stampPath = path.join(dataDir, '.last-launch');
+    const stampPath = path.join(HUD_HOME, '.last-launch');
     const now = Date.now();
     try {
       const prev = Number(fs.readFileSync(stampPath, 'utf-8').trim());
@@ -116,13 +140,13 @@ function maybeLaunchApp(dataDir) {
   }
 }
 
-function maybeSpawnQuotaRefresh(dataDir, eventName, socketOk) {
+function maybeSpawnQuotaRefresh(eventName, socketOk) {
   try {
     const lsAddress = process.env.ANTIGRAVITY_LS_ADDRESS || '';
     const csrfToken = process.env.ANTIGRAVITY_CSRF_TOKEN || '';
     if (!lsAddress || !csrfToken) return;
 
-    const quotaPath = path.join(dataDir, 'quota.json');
+    const quotaPath = path.join(HUD_HOME, 'quota.json');
     let ageMs = Infinity;
     try {
       const st = fs.statSync(quotaPath);
@@ -145,7 +169,7 @@ function maybeSpawnQuotaRefresh(dataDir, eventName, socketOk) {
       stdio: 'ignore',
       env: {
         ...process.env,
-        AGY_HUD_DATA_DIR: dataDir,
+        AGY_HUD_DATA_DIR: HUD_HOME,
       },
     });
     child.unref();
@@ -164,6 +188,7 @@ async function main() {
     const nowMs = Date.now();
     const dataDir = resolveDataDir();
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(HUD_HOME, { recursive: true, mode: 0o700 });
 
     const conversationId = String(input?.conversationId || '');
     const transcriptPath = String(input?.transcriptPath || '');
@@ -177,12 +202,32 @@ async function main() {
       : null;
 
     // Update sanitized runtime-state.json (NEVER persist CSRF token!)
+    const autoCompactOverride = String(
+      process.env.AGY_CLI_AUTO_COMPACT_OVERRIDE || ''
+    ).trim();
+    const tmuxSocket = parseTmuxSocket(process.env.TMUX);
+    const tmuxPane = String(process.env.TMUX_PANE || '').trim();
     const statePath = path.join(dataDir, 'runtime-state.json');
     const prevState = safeReadJson(statePath) || {};
     const timings =
       prevState.timings && typeof prevState.timings === 'object'
         ? { ...prevState.timings }
         : {};
+    const autoCompactOverrides =
+      prevState.autoCompactOverrides &&
+      typeof prevState.autoCompactOverrides === 'object'
+        ? { ...prevState.autoCompactOverrides }
+        : {};
+    const tmuxPanes =
+      prevState.tmuxPanes && typeof prevState.tmuxPanes === 'object'
+        ? { ...prevState.tmuxPanes }
+        : {};
+    if (conversationId) {
+      autoCompactOverrides[conversationId] = autoCompactOverride;
+      if (tmuxSocket && tmuxPane) {
+        tmuxPanes[`${tmuxSocket}|${tmuxPane}`] = conversationId;
+      }
+    }
 
     if (conversationId) {
       const list = Array.isArray(timings[conversationId])
@@ -225,11 +270,24 @@ async function main() {
         delete timings[k];
       }
     }
+    const overrideKeys = Object.keys(autoCompactOverrides);
+    if (overrideKeys.length > 16) {
+      for (const k of overrideKeys.slice(0, overrideKeys.length - 16)) {
+        delete autoCompactOverrides[k];
+      }
+    }
+    const tmuxPaneKeys = Object.keys(tmuxPanes);
+    if (tmuxPaneKeys.length > 24) {
+      for (const k of tmuxPaneKeys.slice(0, tmuxPaneKeys.length - 24)) {
+        delete tmuxPanes[k];
+      }
+    }
 
     const nextState = {
       activeConversationId: conversationId || prevState.activeConversationId || '',
       activeTranscriptPath: transcriptPath || prevState.activeTranscriptPath || '',
       activeModelName: modelName || prevState.activeModelName || '',
+      activeAutoCompactOverride: autoCompactOverride,
       lastEvent: hookEventName,
       lastEventMs: nowMs,
       isGenerating:
@@ -240,15 +298,22 @@ async function main() {
             : Boolean(prevState.isGenerating),
       lsAddress: process.env.ANTIGRAVITY_LS_ADDRESS || prevState.lsAddress || '',
       timings,
+      autoCompactOverrides,
+      tmuxPanes,
     };
 
     writeAtomic0600(statePath, nextState);
 
     // Send IPC message (includes in-memory CSRF token ONLY over 0600 Unix socket)
-    const sockPath = path.join(dataDir, 'hud.sock');
+    const sockPath = path.join(HUD_HOME, 'hud.sock');
     const ipcPayload = {
       event: hookEventName,
       tsMs: nowMs,
+      source: detectSource(dataDir, transcriptPath),
+      agentPid: process.ppid,
+      autoCompactOverride,
+      tmuxSocket,
+      tmuxPane,
       conversationId,
       transcriptPath,
       modelName,
@@ -261,9 +326,9 @@ async function main() {
 
     const socketOk = await sendSocketIPC(sockPath, ipcPayload);
     if (!socketOk) {
-      maybeLaunchApp(dataDir);
+      maybeLaunchApp();
     }
-    maybeSpawnQuotaRefresh(dataDir, hookEventName, socketOk);
+    maybeSpawnQuotaRefresh(hookEventName, socketOk);
   } catch {
     // Always stay non-blocking
   }

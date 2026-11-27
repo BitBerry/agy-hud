@@ -9,10 +9,16 @@ final class WindowTracker {
 
     private var workspaceObservers: [NSObjectProtocol] = []
     private var geometryTimer: Timer?
-    private var lastDockedAntigravityRect: NSRect?
+    private var hostScanTimer: Timer?
     private var isDraggingPanel = false
 
-    private let targetBundleIds: Set<String> = ["com.google.antigravity"]
+    /// App whose window the panel is docked to: Antigravity, or a terminal hosting agy.
+    private var dockTarget: NSRunningApplication?
+    private var lastDockedRect: NSRect?
+    private var lastDockedPid: pid_t = 0
+    private var cliHostPids: Set<pid_t> = []
+
+    private let antigravityBundleIds: Set<String> = ["com.google.antigravity"]
 
     init(state: HUDState, panel: HUDPanel, monitor: TranscriptMonitor) {
         self.state = state
@@ -27,29 +33,43 @@ final class WindowTracker {
             NSWorkspace.shared.notificationCenter.removeObserver(obs)
         }
         geometryTimer?.invalidate()
+        hostScanTimer?.invalidate()
     }
 
     func setDragging(_ dragging: Bool) {
         isDraggingPanel = dragging
-        if !dragging, let panel, let agyRect = currentAntigravityAppKitRect() {
-            let clamped = clampOrigin(panel.frame.origin, size: panel.frame.size, referenceRect: agyRect)
+        if !dragging, let panel, let hostRect = currentDockRect() {
+            let clamped = clampOrigin(panel.frame.origin, size: panel.frame.size, referenceRect: hostRect)
             if abs(clamped.x - panel.frame.origin.x) > 0.5 || abs(clamped.y - panel.frame.origin.y) > 0.5 {
                 panel.setFrameOrigin(clamped)
             }
-            lastDockedAntigravityRect = agyRect
-            let dxFromRight = Double(panel.frame.maxX - agyRect.maxX)
-            let dyFromTop = Double(panel.frame.maxY - agyRect.maxY)
+            lastDockedRect = hostRect
+            lastDockedPid = dockTarget?.processIdentifier ?? 0
+            let dxFromRight = Double(panel.frame.maxX - hostRect.maxX)
+            let dyFromTop = Double(panel.frame.maxY - hostRect.maxY)
+            let onDesktop = isDockedToAntigravity
             state.updatePrefs { prefs in
-                prefs.customOffsetX = dxFromRight
-                prefs.customOffsetY = dyFromTop
+                if onDesktop {
+                    prefs.customOffsetX = dxFromRight
+                    prefs.customOffsetY = dyFromTop
+                } else {
+                    prefs.cliOffsetX = dxFromRight
+                    prefs.cliOffsetY = dyFromTop
+                }
             }
         }
     }
 
     func snapToRightEdge() {
+        let onDesktop = isDockedToAntigravity
         state.updatePrefs { prefs in
-            prefs.customOffsetX = nil
-            prefs.customOffsetY = nil
+            if onDesktop {
+                prefs.customOffsetX = nil
+                prefs.customOffsetY = nil
+            } else {
+                prefs.cliOffsetX = nil
+                prefs.cliOffsetY = nil
+            }
         }
         evaluateVisibilityAndPosition(forceSnap: true)
     }
@@ -67,13 +87,30 @@ final class WindowTracker {
     }
 
     func evaluateVisibilityAndPosition(forceSnap: Bool = false) {
+        cliHostPids = AgentProcessScanner.cliHostPids()
+
+        let front = NSWorkspace.shared.frontmostApplication
+        let frontIsSelf = front?.processIdentifier == ProcessInfo.processInfo.processIdentifier
+        let frontSources = front.map { sources(hostedBy: $0) } ?? []
+
+        if let front, !frontSources.isEmpty {
+            dockTarget = front
+            monitor?.setFocusContext(sources: frontSources, hostPid: front.processIdentifier)
+        } else if let current = dockTarget, !current.isTerminated, !sources(hostedBy: current).isEmpty {
+            // Keep following the last host while another app is in front.
+            monitor?.setFocusHostPid(current.processIdentifier)
+        } else {
+            dockTarget = fallbackDockTarget()
+            monitor?.setFocusHostPid(dockTarget?.processIdentifier)
+        }
+
         let shouldShow: Bool
         if state.userHidden {
             shouldShow = false
         } else if state.alwaysOnTop {
             shouldShow = true
         } else {
-            shouldShow = isAntigravityOrSelfFrontmost()
+            shouldShow = !frontSources.isEmpty || frontIsSelf
         }
 
         if state.isVisible != shouldShow {
@@ -112,6 +149,19 @@ final class WindowTracker {
             }
             workspaceObservers.append(token)
         }
+
+        // Starting or quitting agy in a terminal that is already frontmost raises no
+        // workspace notification, so the set of hosting terminals is re-read on a timer.
+        hostScanTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if AgentProcessScanner.cliHostPids() != self.cliHostPids {
+                    self.evaluateVisibilityAndPosition(forceSnap: false)
+                } else if self.state.isVisible {
+                    self.monitor?.updatePollingCadence()
+                }
+            }
+        }
     }
 
     private func ensureGeometryTimerRunning() {
@@ -129,34 +179,54 @@ final class WindowTracker {
         geometryTimer = nil
     }
 
-    private func isAntigravityOrSelfFrontmost() -> Bool {
-        guard let front = NSWorkspace.shared.frontmostApplication else { return false }
-        if let bundleId = front.bundleIdentifier {
-            if targetBundleIds.contains(bundleId) || bundleId == Bundle.main.bundleIdentifier {
-                return true
-            }
+    // MARK: - Host apps
+
+    private func isAntigravity(_ app: NSRunningApplication) -> Bool {
+        if let bundleId = app.bundleIdentifier {
+            if antigravityBundleIds.contains(bundleId) { return true }
+            if bundleId.contains("helper") { return false }
         }
-        if let name = front.localizedName, name == "Antigravity" {
-            return true
-        }
-        return false
+        return app.localizedName == "Antigravity"
     }
 
-    private func findAntigravityApp() -> NSRunningApplication? {
-        NSWorkspace.shared.runningApplications.first { app in
-            if let bid = app.bundleIdentifier, targetBundleIds.contains(bid) {
-                return true
-            }
-            return app.localizedName == "Antigravity" && !(app.bundleIdentifier?.contains("helper") ?? false)
+    /// Which front ends `app` is showing, limited to the ones the user chose to track.
+    private func sources(hostedBy app: NSRunningApplication) -> Set<AgentSource> {
+        var result: Set<AgentSource> = []
+        if isAntigravity(app), state.sourceMode != .cli {
+            result.insert(.desktop)
         }
+        if cliHostPids.contains(app.processIdentifier), state.sourceMode != .desktop {
+            result.insert(.cli)
+        }
+        return result
     }
 
-    private func currentAntigravityAppKitRect() -> NSRect? {
-        guard let app = findAntigravityApp(), !app.isHidden else { return nil }
+    private func fallbackDockTarget() -> NSRunningApplication? {
+        let running = NSWorkspace.shared.runningApplications
+        if state.sourceMode != .cli, let desktop = running.first(where: { isAntigravity($0) }) {
+            return desktop
+        }
+        if state.sourceMode != .desktop {
+            return running.first { cliHostPids.contains($0.processIdentifier) }
+        }
+        return nil
+    }
+
+    private var isDockedToAntigravity: Bool {
+        dockTarget.map { isAntigravity($0) } ?? true
+    }
+
+    private func currentDockRect() -> NSRect? {
+        guard let app = dockTarget, !app.isTerminated, !app.isHidden else { return nil }
         let pid = app.processIdentifier
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
             return nil
         }
+
+        // Antigravity is docked by its main (largest) window. A terminal usually has
+        // several similar windows, so there the frontmost one is the session in use;
+        // the window list is ordered front to back.
+        let preferLargest = isAntigravity(app)
 
         // Quartz coordinates have origin at top-left of the primary display.
         let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? NSScreen.main?.frame.height ?? 900.0
@@ -172,11 +242,15 @@ final class WindowTracker {
                 continue
             }
             guard cgRect.width > 200 && cgRect.height > 200 else { continue }
+            let appKitY = primaryScreenHeight - cgRect.origin.y - cgRect.height
+            let rect = NSRect(x: cgRect.origin.x, y: appKitY, width: cgRect.width, height: cgRect.height)
+            if !preferLargest {
+                return rect
+            }
             let area = cgRect.width * cgRect.height
             if area > bestArea {
                 bestArea = area
-                let appKitY = primaryScreenHeight - cgRect.origin.y - cgRect.height
-                bestRect = NSRect(x: cgRect.origin.x, y: appKitY, width: cgRect.width, height: cgRect.height)
+                bestRect = rect
             }
         }
         return bestRect
@@ -186,25 +260,35 @@ final class WindowTracker {
         let size = panel.frame.size
         guard size.width > 0, size.height > 0 else { return }
 
-        if let agyRect = currentAntigravityAppKitRect() {
-            if !forceSnap, let prev = lastDockedAntigravityRect,
-               abs(prev.origin.x - agyRect.origin.x) < 1.0,
-               abs(prev.origin.y - agyRect.origin.y) < 1.0,
-               abs(prev.size.width - agyRect.size.width) < 1.0,
-               abs(prev.size.height - agyRect.size.height) < 1.0 {
+        if let hostRect = currentDockRect() {
+            let hostPid = dockTarget?.processIdentifier ?? 0
+            if !forceSnap, hostPid == lastDockedPid, let prev = lastDockedRect,
+               abs(prev.origin.x - hostRect.origin.x) < 1.0,
+               abs(prev.origin.y - hostRect.origin.y) < 1.0,
+               abs(prev.size.width - hostRect.size.width) < 1.0,
+               abs(prev.size.height - hostRect.size.height) < 1.0 {
                 return
             }
-            lastDockedAntigravityRect = agyRect
+            lastDockedRect = hostRect
+            lastDockedPid = hostPid
 
-            let dx = state.prefs.customOffsetX ?? -14.0
-            let dy = state.prefs.customOffsetY ?? -62.0
+            // Defaults clear Antigravity's toolbar, and a terminal's title/tab bar.
+            let dx: Double
+            let dy: Double
+            if isDockedToAntigravity {
+                dx = state.prefs.customOffsetX ?? -14.0
+                dy = state.prefs.customOffsetY ?? -62.0
+            } else {
+                dx = state.prefs.cliOffsetX ?? -14.0
+                dy = state.prefs.cliOffsetY ?? -44.0
+            }
             var origin = NSPoint(
-                x: agyRect.maxX + dx - size.width,
-                y: agyRect.maxY + dy - size.height
+                x: hostRect.maxX + dx - size.width,
+                y: hostRect.maxY + dy - size.height
             )
-            origin = clampOrigin(origin, size: size, referenceRect: agyRect)
+            origin = clampOrigin(origin, size: size, referenceRect: hostRect)
             panel.setFrameOrigin(origin)
-        } else if forceSnap || lastDockedAntigravityRect == nil {
+        } else if forceSnap || lastDockedRect == nil {
             let visible = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
             let origin = NSPoint(
                 x: visible.maxX - size.width - 14,
@@ -215,9 +299,9 @@ final class WindowTracker {
     }
 
     func clampOrigin(_ origin: NSPoint, size: NSSize, referenceRect: NSRect? = nil) -> NSPoint {
-        let agyRect = referenceRect ?? currentAntigravityAppKitRect()
+        let hostRect = referenceRect ?? currentDockRect()
         let screen: NSScreen?
-        if let ref = agyRect {
+        if let ref = hostRect {
             screen = NSScreen.screens.max(by: {
                 $0.frame.intersection(ref).area < $1.frame.intersection(ref).area
             }) ?? NSScreen.main ?? NSScreen.screens.first
@@ -225,13 +309,13 @@ final class WindowTracker {
             screen = NSScreen.screens.first(where: { $0.frame.contains(origin) }) ?? NSScreen.main ?? NSScreen.screens.first
         }
 
-        if let agyRect {
+        if let hostRect {
             let bounds: NSRect
             if let visible = screen?.visibleFrame {
-                let intersected = agyRect.intersection(visible)
-                bounds = (!intersected.isNull && intersected.width >= 80 && intersected.height >= 40) ? intersected : agyRect
+                let intersected = hostRect.intersection(visible)
+                bounds = (!intersected.isNull && intersected.width >= 80 && intersected.height >= 40) ? intersected : hostRect
             } else {
-                bounds = agyRect
+                bounds = hostRect
             }
             let inset: CGFloat = 8
             let minX = bounds.minX + inset

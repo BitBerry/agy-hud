@@ -16,6 +16,13 @@ rm -rf "${BUILD_APP}"
 mkdir -p "${BUILD_APP}/Contents/MacOS" "${BUILD_APP}/Contents/Resources"
 cp "${MACOS_SRC}/Resources/Info.plist" "${BUILD_APP}/Contents/Info.plist"
 
+# App icon is rendered from the plugin logo; rebuild it only when the logo changed.
+APP_ICON="${MACOS_SRC}/Resources/AppIcon.icns"
+if [[ ! -f "${APP_ICON}" || "${PLUGIN_SRC}/assets/logo.svg" -nt "${APP_ICON}" ]]; then
+  bash "${ROOT_DIR}/scripts/make-icon.sh"
+fi
+cp "${APP_ICON}" "${BUILD_APP}/Contents/Resources/AppIcon.icns"
+
 swiftc -O \
   -swift-version 5 \
   -target arm64-apple-macosx14.0 \

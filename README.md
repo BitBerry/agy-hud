@@ -1,13 +1,19 @@
 # agy-hud
 
-An Antigravity display enhancement plugin with a native macOS floating HUD (`AgyHUD.app`) that tracks live **Context length**, **TPS**, **Context compaction threshold & history**, and **collapsible dual-window model quota** (`Weekly limit` + `5h limit`).
+An Antigravity display enhancement plugin with a native macOS floating HUD (`AgyHUD.app`) for both the Antigravity desktop app and the `agy` CLI. It tracks live **Context length**, **TPS**, **Context compaction threshold & history**, and **collapsible dual-window model quota** (`Weekly limit` + `5h limit`).
 
 ## Features
 
 - **Native macOS Floating HUD (`NSPanel` + SwiftUI)**
   - Non-activating translucent overlay that never steals keyboard focus from Antigravity.
-  - Auto-shows when Antigravity is frontmost and auto-hides when switching apps (can also be pinned Always-on-Top).
-  - Freely draggable inside Antigravity's main window while clamped strictly within its bounds; follows window moves and resizes relative to Antigravity.
+  - Auto-shows when Antigravity, or a terminal running the `agy` CLI, is frontmost and auto-hides when switching apps (can also be pinned Always-on-Top).
+  - Freely draggable inside the host window while clamped strictly within its bounds; follows window moves and resizes. The position is remembered separately for Antigravity and for terminals.
+- **Antigravity Desktop + `agy` CLI**
+  - One HUD follows whichever is in front: the conversation you are viewing in Antigravity, the focused `tmux` pane/window running `agy`, or the most recently active CLI session. A `桌面` / `CLI` badge shows which one is displayed.
+  - CLI sessions are found by process, so the terminal can be any app (Ghostty, iTerm2, Terminal, an editor's integrated terminal), including parallel sessions inside `tmux`.
+  - Auto-launch on hooks is off by default and can be toggled from the menu bar item (`随 Antigravity / agy 自动启动`).
+  - The menu bar item's `数据来源` submenu can lock the HUD to one of the two.
+  - Model quota is served only by the desktop app's language server. During CLI-only use the quota row keeps the last synced values and shows their age.
   - Collapsible **Mini Pill** mode displaying live `Context / Compaction Threshold`, remaining compaction percentage (`压剩 XX%`), TPS, and active quota.
 - **Context Length**
   - Exact `input_tokens + cache_read_tokens` from `transcript.jsonl`, cache hit rate, per-turn delta, output tokens, and dual-zone progress bar with compaction threshold tick.
@@ -27,7 +33,7 @@ An Antigravity display enhancement plugin with a native macOS floating HUD (`Agy
 - macOS 14+ (Apple Silicon)
 - Xcode Command Line Tools (`swiftc`)
 - Node.js 18+
-- Google Antigravity App + `agy` CLI
+- Google Antigravity App and/or the `agy` CLI (the plugin directory is shared by both)
 
 ## Build & Install
 
@@ -56,9 +62,11 @@ agy-hud/
 │       └── quota-refresh.mjs     # Detached RetrieveUserQuotaSummary / GetUserStatus fetcher
 ├── macos/
 │   ├── Resources/Info.plist      # LSUIElement menu-bar + floating HUD app config
+│   ├── Resources/AppIcon.icns    # App icon, generated from plugin/assets/logo.svg
 │   └── Sources/                  # Swift / AppKit / SwiftUI source files
 └── scripts/
-    └── build-and-install.sh      # Build, sign, install, and strict validation script
+    ├── build-and-install.sh      # Build, sign, install, and strict validation script
+    └── make-icon.sh              # Regenerate AppIcon.icns from the plugin logo
 ```
 
 ## License

@@ -61,7 +61,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         menu.removeAllItems()
 
         let summary = NSMenuItem(
-            title: "\(state.modelDisplayName) · \(HUDFormatters.formatTokens(state.contextTokens)) · \(HUDFormatters.formatTps(state.lastTurnTps)) tok/s",
+            title: "\(state.activeSource.badge) · \(state.modelDisplayName) · \(HUDFormatters.formatTokens(state.contextTokens)) · \(HUDFormatters.formatTps(state.lastTurnTps)) tok/s",
             action: nil,
             keyEquivalent: ""
         )
@@ -79,14 +79,26 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         togglePill.state = state.isMiniPill ? .on : .off
         menu.addItem(togglePill)
 
-        let followFront = NSMenuItem(title: "仅 Antigravity 前台显示", action: #selector(toggleFollowFront), keyEquivalent: "")
+        let followFront = NSMenuItem(title: "仅 Antigravity / agy 终端在前台时显示", action: #selector(toggleFollowFront), keyEquivalent: "")
         followFront.target = self
         followFront.state = state.alwaysOnTop ? .off : .on
         menu.addItem(followFront)
 
-        let snapItem = NSMenuItem(title: "吸附到 Antigravity 右侧", action: #selector(snapRight), keyEquivalent: "")
+        let snapItem = NSMenuItem(title: "吸附到窗口右上角", action: #selector(snapRight), keyEquivalent: "")
         snapItem.target = self
         menu.addItem(snapItem)
+
+        let themeMenuItem = NSMenuItem(title: "外观主题", action: nil, keyEquivalent: "")
+        let themeSubmenu = NSMenu()
+        for theme in HUDTheme.allCases {
+            let item = NSMenuItem(title: theme.menuTitle, action: #selector(selectTheme(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = theme.rawValue
+            item.state = state.theme == theme ? .on : .off
+            themeSubmenu.addItem(item)
+        }
+        themeMenuItem.submenu = themeSubmenu
+        menu.addItem(themeMenuItem)
 
         menu.addItem(.separator())
 
@@ -105,6 +117,22 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
+        let sourceMenuItem = NSMenuItem(title: "数据来源", action: nil, keyEquivalent: "")
+        let sourceSubmenu = NSMenu()
+        let autoSourceItem = NSMenuItem(title: "自动（跟随前台窗口）", action: #selector(selectSourceMode(_:)), keyEquivalent: "")
+        autoSourceItem.target = self
+        autoSourceItem.state = state.sourceMode == nil ? .on : .off
+        sourceSubmenu.addItem(autoSourceItem)
+        for source in AgentSource.allCases {
+            let item = NSMenuItem(title: "仅 \(source.menuTitle)", action: #selector(selectSourceMode(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = source.rawValue
+            item.state = state.sourceMode == source ? .on : .off
+            sourceSubmenu.addItem(item)
+        }
+        sourceMenuItem.submenu = sourceSubmenu
+        menu.addItem(sourceMenuItem)
+
         let convMenuItem = NSMenuItem(title: "跟踪对话", action: nil, keyEquivalent: "")
         let convSubmenu = NSMenu()
         let autoItem = NSMenuItem(title: "自动跟随活跃对话", action: #selector(selectAutoConversation), keyEquivalent: "")
@@ -114,7 +142,8 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         if !state.recentConversations.isEmpty {
             convSubmenu.addItem(.separator())
             for conv in state.recentConversations {
-                let item = NSMenuItem(title: conv.title, action: #selector(selectSpecificConversation(_:)), keyEquivalent: "")
+                let title = conv.source == .cli ? "[CLI] \(conv.title)" : conv.title
+                let item = NSMenuItem(title: title, action: #selector(selectSpecificConversation(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = conv.id
                 item.state = state.pinnedConversationId == conv.id ? .on : .off
@@ -124,7 +153,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         convMenuItem.submenu = convSubmenu
         menu.addItem(convMenuItem)
 
-        let autoLaunchItem = NSMenuItem(title: "随 Antigravity 自动启动", action: #selector(toggleAutoLaunch), keyEquivalent: "")
+        let autoLaunchItem = NSMenuItem(title: "随 Antigravity / agy 自动启动", action: #selector(toggleAutoLaunch), keyEquivalent: "")
         autoLaunchItem.target = self
         autoLaunchItem.state = state.autoLaunch ? .on : .off
         menu.addItem(autoLaunchItem)
@@ -196,9 +225,27 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         }
     }
 
+    @objc private func selectSourceMode(_ sender: NSMenuItem) {
+        let mode = (sender.representedObject as? String).flatMap { AgentSource(rawValue: $0) }
+        state.updatePrefs { prefs in
+            prefs.sourceMode = mode
+        }
+        monitor.updatePollingCadence()
+        monitor.refreshNow(scanConversations: true)
+        windowTracker.evaluateVisibilityAndPosition(forceSnap: false)
+    }
+
     @objc private func toggleAutoLaunch() {
         state.updatePrefs { prefs in
             prefs.autoLaunch.toggle()
+        }
+    }
+
+    @objc private func selectTheme(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let theme = HUDTheme(rawValue: raw) else { return }
+        state.updatePrefs { prefs in
+            prefs.theme = theme
         }
     }
 
