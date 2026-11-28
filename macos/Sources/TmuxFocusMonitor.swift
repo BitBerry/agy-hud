@@ -22,6 +22,7 @@ struct TmuxServerSnapshot: Equatable, Sendable {
     let socket: String
     let clients: [TmuxClientInfo]
     let panes: [TmuxPaneInfo]
+    let focusEventsEnabled: Bool
 }
 
 /// Polls active tmux servers (only those hosting live `agy` CLI processes) on a
@@ -37,7 +38,9 @@ final class TmuxFocusMonitor {
     private var pendingForcedProbe = false
 
     private(set) var snapshots: [String: TmuxServerSnapshot] = [:]
+    private(set) var lastPollStartedAt: Date = .distantPast
     var onSnapshotChanged: (() -> Void)?
+    var onPollCompleted: (() -> Void)?
 
     func setActive(_ active: Bool) {
         if active == isActive {
@@ -83,6 +86,7 @@ final class TmuxFocusMonitor {
         isPolling = true
         pendingProbe = false
         pendingForcedProbe = false
+        let pollStartedAt = Date()
 
         queue.async { [weak self] in
             var next: [String: TmuxServerSnapshot] = [:]
@@ -95,10 +99,13 @@ final class TmuxFocusMonitor {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isPolling = false
+                self.lastPollStartedAt = pollStartedAt
                 let changed = (next != self.snapshots)
                 if changed {
                     self.snapshots = next
                     self.onSnapshotChanged?()
+                } else {
+                    self.onPollCompleted?()
                 }
                 if self.pendingProbe && (self.isActive || self.pendingForcedProbe) {
                     let nextForce = self.pendingForcedProbe
@@ -130,10 +137,13 @@ final class TmuxFocusMonitor {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: tmuxPath)
         process.arguments = [
+            "-u",
             "-S", socket,
-            "list-clients", "-F", "C\t#{client_activity}\t#{client_pid}\t#{session_id}\t#{window_id}\t#{pane_id}\t#{pane_pid}\t#{client_flags}",
+            "list-clients", "-F", "C|#{client_activity}|#{client_pid}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{client_flags}",
             ";",
-            "list-panes", "-a", "-F", "P\t#{session_id}\t#{window_id}\t#{pane_id}\t#{pane_active}\t#{pane_pid}",
+            "list-panes", "-a", "-F", "P|#{session_id}|#{window_id}|#{pane_id}|#{pane_active}|#{pane_pid}",
+            ";",
+            "display-message", "-p", "O|#{focus-events}",
         ]
         process.standardInput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -171,9 +181,10 @@ final class TmuxFocusMonitor {
 
         var clients: [TmuxClientInfo] = []
         var panes: [TmuxPaneInfo] = []
+        var focusEventsEnabled = false
 
         for rawLine in output.split(separator: "\n", omittingEmptySubsequences: true) {
-            let cols = rawLine.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            let cols = rawLine.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
             guard let kind = cols.first else { continue }
             if kind == "C", cols.count >= 8 {
                 let activity = Int64(cols[1]) ?? 0
@@ -210,9 +221,17 @@ final class TmuxFocusMonitor {
                         panePid: panePid
                     ))
                 }
+            } else if kind == "O", cols.count >= 2 {
+                let val = cols[1].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                focusEventsEnabled = (val == "1" || val == "on")
             }
         }
 
-        return TmuxServerSnapshot(socket: socket, clients: clients, panes: panes)
+        return TmuxServerSnapshot(
+            socket: socket,
+            clients: clients,
+            panes: panes,
+            focusEventsEnabled: focusEventsEnabled
+        )
     }
 }

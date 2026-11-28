@@ -16,6 +16,7 @@ final class WindowTracker {
     private var dockTarget: NSRunningApplication?
     private var lastDockedRect: NSRect?
     private var lastDockedPid: pid_t = 0
+    private var lastDockedWindowNumber: Int = 0
     private var cliHostPids: Set<pid_t> = []
 
     private let antigravityBundleIds: Set<String> = ["com.google.antigravity"]
@@ -93,17 +94,6 @@ final class WindowTracker {
         let frontIsSelf = front?.processIdentifier == ProcessInfo.processInfo.processIdentifier
         let frontSources = front.map { sources(hostedBy: $0) } ?? []
 
-        if let front, !frontSources.isEmpty {
-            dockTarget = front
-            monitor?.setFocusContext(sources: frontSources, hostPid: front.processIdentifier)
-        } else if let current = dockTarget, !current.isTerminated, !sources(hostedBy: current).isEmpty {
-            // Keep following the last host while another app is in front.
-            monitor?.setFocusHostPid(current.processIdentifier)
-        } else {
-            dockTarget = fallbackDockTarget()
-            monitor?.setFocusHostPid(dockTarget?.processIdentifier)
-        }
-
         let shouldShow: Bool
         if state.userHidden {
             shouldShow = false
@@ -116,6 +106,22 @@ final class WindowTracker {
         if state.isVisible != shouldShow {
             state.isVisible = shouldShow
             monitor?.updatePollingCadence()
+        }
+
+        if let front, !frontSources.isEmpty {
+            dockTarget = front
+            monitor?.setFocusContext(
+                sources: frontSources,
+                hostPid: front.processIdentifier,
+                isHostFrontmost: true
+            )
+        } else if let current = dockTarget, !current.isTerminated, !sources(hostedBy: current).isEmpty {
+            // Keep following the last host while another app (or the HUD itself) is in front.
+            let hostStillFront = frontIsSelf ? (monitor?.isFocusHostFrontmost ?? false) : false
+            monitor?.setFocusHostPid(current.processIdentifier, isHostFrontmost: hostStillFront)
+        } else {
+            dockTarget = fallbackDockTarget()
+            monitor?.setFocusHostPid(dockTarget?.processIdentifier, isHostFrontmost: false)
         }
 
         guard let panel else { return }
@@ -144,6 +150,9 @@ final class WindowTracker {
         for name in names {
             let token = nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor [weak self] in
+                    if name == NSWorkspace.didActivateApplicationNotification {
+                        AgentProcessScanner.invalidateCache()
+                    }
                     self?.evaluateVisibilityAndPosition(forceSnap: false)
                 }
             }
@@ -216,7 +225,7 @@ final class WindowTracker {
         dockTarget.map { isAntigravity($0) } ?? true
     }
 
-    private func currentDockRect() -> NSRect? {
+    private func currentDockWindow() -> (rect: NSRect, windowNumber: Int)? {
         guard let app = dockTarget, !app.isTerminated, !app.isHidden else { return nil }
         let pid = app.processIdentifier
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
@@ -230,7 +239,7 @@ final class WindowTracker {
 
         // Quartz coordinates have origin at top-left of the primary display.
         let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? NSScreen.main?.frame.height ?? 900.0
-        var bestRect: NSRect?
+        var bestWindow: (rect: NSRect, windowNumber: Int)?
         var bestArea: CGFloat = 0
 
         for win in list {
@@ -242,26 +251,39 @@ final class WindowTracker {
                 continue
             }
             guard cgRect.width > 200 && cgRect.height > 200 else { continue }
+            let windowNumber = (win[kCGWindowNumber as String] as? Int) ?? 0
             let appKitY = primaryScreenHeight - cgRect.origin.y - cgRect.height
             let rect = NSRect(x: cgRect.origin.x, y: appKitY, width: cgRect.width, height: cgRect.height)
             if !preferLargest {
-                return rect
+                return (rect, windowNumber)
             }
             let area = cgRect.width * cgRect.height
             if area > bestArea {
                 bestArea = area
-                bestRect = rect
+                bestWindow = (rect, windowNumber)
             }
         }
-        return bestRect
+        return bestWindow
+    }
+
+    private func currentDockRect() -> NSRect? {
+        currentDockWindow()?.rect
     }
 
     private func positionPanel(_ panel: HUDPanel, forceSnap: Bool) {
         let size = panel.frame.size
         guard size.width > 0, size.height > 0 else { return }
 
-        if let hostRect = currentDockRect() {
+        if let dockWindow = currentDockWindow() {
+            let hostRect = dockWindow.rect
             let hostPid = dockTarget?.processIdentifier ?? 0
+            let windowChanged = (hostPid == lastDockedPid && dockWindow.windowNumber != 0 && dockWindow.windowNumber != lastDockedWindowNumber)
+            if windowChanged {
+                lastDockedWindowNumber = dockWindow.windowNumber
+                monitor?.handleHostWindowChanged()
+            } else if hostPid != lastDockedPid || lastDockedWindowNumber == 0 {
+                lastDockedWindowNumber = dockWindow.windowNumber
+            }
             if !forceSnap, hostPid == lastDockedPid, let prev = lastDockedRect,
                abs(prev.origin.x - hostRect.origin.x) < 1.0,
                abs(prev.origin.y - hostRect.origin.y) < 1.0,

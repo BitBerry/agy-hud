@@ -16,6 +16,8 @@ enum AgentProcessScanner {
         let tmuxSocket: String?
         /// Tmux pane ID from `$TMUX_PANE` (e.g. `%18`), if running inside tmux.
         let tmuxPane: String?
+        /// Controlling TTY path (e.g. `/dev/ttys004`), if attached to a terminal.
+        let ttyPath: String?
     }
 
     struct OpenConversationHandles: Equatable {
@@ -79,7 +81,43 @@ enum AgentProcessScanner {
     }
 
     static func hostAppPid(of pid: pid_t) -> pid_t? {
-        ancestry(of: pid).host
+        if let host = ancestry(of: pid).host {
+            return host
+        }
+        // Session-manager daemons (e.g. iTermServer) break the parent chain,
+        // while the terminal still stamps its bundle id on launched children.
+        if let (_, env) = argumentsAndEnvironment(of: pid),
+           let bundleId = env["__CFBundleIdentifier"],
+           let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
+               .first(where: { $0.activationPolicy == .regular }) {
+            return app.processIdentifier
+        }
+        return nil
+    }
+
+    static func ttyPath(of pid: pid_t) -> String? {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.stride)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+        let tdev = dev_t(bitPattern: info.e_tdev)
+        guard tdev != 0 && tdev != -1 else { return nil }
+        guard let cstr = devname(tdev, S_IFCHR) else { return nil }
+        let name = String(cString: cstr)
+        guard !name.isEmpty && name != "??" else { return nil }
+        return "/dev/\(name)"
+    }
+
+    /// Last time input was read from `ttyPath` (keystrokes / terminal events, unaffected by output).
+    static func ttyInputTime(ofPath ttyPath: String?) -> TimeInterval? {
+        guard let ttyPath, !ttyPath.isEmpty else { return nil }
+        var st = stat()
+        guard stat(ttyPath, &st) == 0 else { return nil }
+        let ts = Double(st.st_atimespec.tv_sec) + Double(st.st_atimespec.tv_nsec) / 1_000_000_000.0
+        return ts > 0 ? ts : nil
+    }
+
+    static func ttyInputTime(of pid: pid_t) -> TimeInterval? {
+        ttyInputTime(ofPath: ttyPath(of: pid))
     }
 
     static func isDescendant(_ pid: pid_t, of ancestorPid: pid_t) -> Bool {
@@ -221,12 +259,15 @@ enum AgentProcessScanner {
             }
         }
 
-        // A tmux client sits under a terminal app; the server is daemonized and has
-        // no GUI ancestor. Client hosts are resolved only if a session needs them.
+        // A tmux client sits under a terminal app with a controlling TTY; the server
+        // is daemonized with no TTY or GUI ancestor. Client hosts are resolved lazily.
         var tmuxClientHosts: Set<pid_t>?
         func resolveTmuxClientHosts() -> Set<pid_t> {
             if let known = tmuxClientHosts { return known }
-            let hosts = Set(tmuxPids.compactMap { ancestry(of: $0).host })
+            let hosts = Set(tmuxPids.compactMap { pid -> pid_t? in
+                guard ttyPath(of: pid) != nil else { return nil }
+                return hostAppPid(of: pid)
+            })
             tmuxClientHosts = hosts
             return hosts
         }
@@ -240,13 +281,17 @@ enum AgentProcessScanner {
 
             let lineage = ancestry(of: pid)
             var hosts: Set<pid_t> = []
-            let tmuxSocket = parseTmuxSocket(env["TMUX"])
-            let rawPane = env["TMUX_PANE"]?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let tmuxPane = (rawPane?.isEmpty == false) ? rawPane : nil
+            // A direct GUI-app descendant that did not pass through tmux cannot live inside
+            // a tmux pane even if it inherited a stale $TMUX environment variable.
+            let canBeInTmux = lineage.passedTmux || lineage.host == nil
+            let tmuxSocket = canBeInTmux ? parseTmuxSocket(env["TMUX"]) : nil
+            let rawPane = canBeInTmux ? env["TMUX_PANE"]?.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+            let tmuxPane = (tmuxSocket != nil && rawPane?.isEmpty == false) ? rawPane : nil
             if let host = lineage.host {
                 hosts.insert(host)
-            } else if lineage.passedTmux || tmuxSocket != nil {
-                hosts = resolveTmuxClientHosts()
+            }
+            if lineage.passedTmux || tmuxSocket != nil {
+                hosts.formUnion(resolveTmuxClientHosts())
             }
             // Session-manager daemons break the process chain too; the terminal still
             // stamps its bundle id on everything it launched.
@@ -262,7 +307,8 @@ enum AgentProcessScanner {
                 hostPids: hosts,
                 autoCompactOverride: autoCompactOverride,
                 tmuxSocket: tmuxSocket,
-                tmuxPane: tmuxPane
+                tmuxPane: tmuxPane,
+                ttyPath: ttyPath(of: pid)
             ))
         }
         return agents
@@ -310,11 +356,14 @@ enum AgentProcessScanner {
         return String(cString: buffer)
     }
 
+    /// Uses `KERN_PROC_PID` instead of `proc_pidinfo(PROC_PIDTBSDINFO)` so ancestry
+    /// walks cleanly across setuid-root `/usr/bin/login` wrappers used by macOS terminals.
     private static func parentPid(of pid: pid_t) -> pid_t? {
-        var info = proc_bsdinfo()
-        let size = Int32(MemoryLayout<proc_bsdinfo>.stride)
-        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
-        return pid_t(info.pbi_ppid)
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        return info.kp_eproc.e_ppid
     }
 
     private static func scanOpenConversationHandles(of pid: pid_t) -> OpenConversationHandles {

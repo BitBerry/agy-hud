@@ -1,3 +1,4 @@
+import Cocoa
 import Foundation
 
 @MainActor
@@ -64,6 +65,11 @@ final class TranscriptMonitor {
         let agent: AgentProcessScanner.CLIAgent?
     }
 
+    private enum HostCLIFocusKind: Equatable {
+        case tmux
+        case nonTmux
+    }
+
     private let state: HUDState
     private weak var quotaClient: QuotaClient?
     private let tmuxFocusMonitor = TmuxFocusMonitor()
@@ -110,6 +116,18 @@ final class TranscriptMonitor {
     private var focusSources: Set<AgentSource> = []
     /// PID of the most recent frontmost host app (terminal or Antigravity).
     private var focusHostPid: pid_t? = nil
+    /// Whether `focusHostPid` is currently the frontmost macOS app.
+    private(set) var isFocusHostFrontmost: Bool = false
+    /// When `focusHostPid` most recently became frontmost (for FocusIn delivery grace).
+    private var hostActivatedAt: Date = .distantPast
+    /// Last resolved CLI focus mode (tmux vs normal terminal) per terminal host PID.
+    private var lastCLIFocusKindByHost: [pid_t: HostCLIFocusKind] = [:]
+    /// Host PIDs where a tmux client has reported `isFocused == false` (proving DECSET 1004 works).
+    private var hostsWithObservedTmuxBlur: Set<pid_t> = []
+    private var hasObservedTmuxSnapshot: Bool = false
+    private var pendingPostActivationRecheck: Bool = false
+    /// Most recent `SessionStart` hook timestamp per `agy` PID.
+    private var sessionStartAtByAgentPid: [pid_t: Date] = [:]
     private var lastObservedTmuxFocus: TmuxFocusKey? = nil
     private var lastTmuxFocusChangedAt: Date = .distantPast
     private var lastUnmatchedPaneRescanKey: String = ""
@@ -121,6 +139,9 @@ final class TranscriptMonitor {
         self.quotaClient = quotaClient
         tmuxFocusMonitor.onSnapshotChanged = { [weak self] in
             self?.handleTmuxSnapshotChanged()
+        }
+        tmuxFocusMonitor.onPollCompleted = { [weak self] in
+            self?.handleTmuxPollCompleted()
         }
         loadRuntimeStateSeed()
         calibrateCompactionThresholdsAsync()
@@ -157,31 +178,57 @@ final class TranscriptMonitor {
     }
 
     /// Called when a window hosting Antigravity and/or the agy CLI comes to the front.
-    func setFocusContext(sources: Set<AgentSource>, hostPid: pid_t?) {
+    func setFocusContext(sources: Set<AgentSource>, hostPid: pid_t?, isHostFrontmost: Bool) {
         guard !sources.isEmpty else { return }
         let sourcesChanged = (sources != focusSources)
         let hostChanged = (hostPid != focusHostPid)
+        let becameFrontmost = isHostFrontmost && (!isFocusHostFrontmost || hostChanged)
         focusSources = sources
         if let hostPid {
             focusHostPid = hostPid
         }
+        isFocusHostFrontmost = isHostFrontmost
+        if hostChanged {
+            ipcTmuxFocusHint = nil
+        }
+        if becameFrontmost {
+            hostActivatedAt = Date()
+            pendingPostActivationRecheck = false
+        }
         updateTmuxPollingState()
         if sources.contains(.cli) {
-            tmuxFocusMonitor.probeNow()
+            tmuxFocusMonitor.probeNow(force: becameFrontmost || hostChanged)
         }
-        if sourcesChanged || hostChanged {
+        if sourcesChanged || hostChanged || becameFrontmost {
             refreshNow(scanConversations: false)
         }
     }
 
-    func setFocusHostPid(_ hostPid: pid_t?) {
-        guard hostPid != focusHostPid else { return }
+    func setFocusHostPid(_ hostPid: pid_t?, isHostFrontmost: Bool) {
+        let hostChanged = (hostPid != focusHostPid)
+        let frontChanged = (isHostFrontmost != self.isFocusHostFrontmost)
+        guard hostChanged || frontChanged else { return }
         focusHostPid = hostPid
+        self.isFocusHostFrontmost = isHostFrontmost
+        if hostChanged {
+            ipcTmuxFocusHint = nil
+        }
+        if isHostFrontmost {
+            hostActivatedAt = Date()
+            pendingPostActivationRecheck = false
+        }
         updateTmuxPollingState()
         if focusSources.contains(.cli) {
-            tmuxFocusMonitor.probeNow()
+            if isHostFrontmost || hostChanged {
+                tmuxFocusMonitor.probeNow(force: true)
+            }
             refreshNow(scanConversations: false)
         }
+    }
+
+    func handleHostWindowChanged() {
+        guard focusSources.contains(.cli), isFocusHostFrontmost else { return }
+        tmuxFocusMonitor.probeNow(force: true)
     }
 
     func handleHookEvent(_ msg: HookIPCMessage) {
@@ -220,11 +267,15 @@ final class TranscriptMonitor {
                let agentPid = AgentProcessScanner.enclosingAgentPid(of: hookParent) {
                 resolvedAgentPid = agentPid
                 agentPidByConv[convId] = agentPid
+                let isSessionStart = (msg.event == "SessionStart")
                 convByAgentPid[agentPid] = HookAgentLink(
                     conversationId: convId,
                     updatedAt: Date(),
-                    fromSessionStart: msg.event == "SessionStart"
+                    fromSessionStart: isSessionStart
                 )
+                if isSessionStart {
+                    sessionStartAtByAgentPid[agentPid] = eventDate
+                }
                 AgentProcessScanner.invalidateOpenHandlesCache(for: agentPid)
             }
 
@@ -327,19 +378,38 @@ final class TranscriptMonitor {
     }
 
     private func handleTmuxSnapshotChanged() {
+        let wasInitial = !hasObservedTmuxSnapshot
+        hasObservedTmuxSnapshot = true
+
+        for snap in tmuxFocusMonitor.snapshots.values {
+            for client in snap.clients where !client.isFocused {
+                if let hostPid = AgentProcessScanner.hostAppPid(of: client.clientPid) {
+                    hostsWithObservedTmuxBlur.insert(hostPid)
+                }
+            }
+        }
+
         let agents = AgentProcessScanner.liveCLIAgents()
         let selection = resolveFocusedTmuxSelection(agents: agents, allowRescan: true)
         let nextKey = selection.map {
             TmuxFocusKey(socket: $0.socket, paneId: $0.paneId, agentPid: $0.agent?.pid)
         }
-        if let prev = lastObservedTmuxFocus, let next = nextKey, prev != next {
-            lastTmuxFocusChangedAt = Date()
-            if let pid = next.agentPid {
-                AgentProcessScanner.invalidateOpenHandlesCache(for: pid)
+        if !wasInitial, nextKey != lastObservedTmuxFocus {
+            if let next = nextKey {
+                lastTmuxFocusChangedAt = Date()
+                if let pid = next.agentPid {
+                    AgentProcessScanner.invalidateOpenHandlesCache(for: pid)
+                }
             }
         }
         lastObservedTmuxFocus = nextKey
         refreshNow(scanConversations: false)
+    }
+
+    private func handleTmuxPollCompleted() {
+        if pendingPostActivationRecheck {
+            refreshNow(scanConversations: false)
+        }
     }
 
     func refreshNow(scanConversations: Bool) {
@@ -352,6 +422,7 @@ final class TranscriptMonitor {
             refreshRecentConversations()
         }
 
+        pendingPostActivationRecheck = false
         let target = resolveTargetTranscript()
         if state.activeSource != target.source {
             state.activeSource = target.source
@@ -898,14 +969,20 @@ final class TranscriptMonitor {
         if let focused = resolveFocusedTmuxSelection(agents: agents, allowRescan: false),
            let agent = focused.agent,
            let convId = resolveConversationId(for: agent) {
+            if let hostPid = focusHostPid {
+                lastCLIFocusKindByHost[hostPid] = .tmux
+            }
             recordLiveAgentLink(agent: agent, conversationId: convId, paneIdOverride: focused.paneId)
             return (transcriptPath(for: convId), convId)
         }
 
         if let hostPid = focusHostPid {
             let nonTmuxInHost = agents.filter { $0.tmuxSocket == nil && $0.hostPids.contains(hostPid) }
-            if let chosen = pickPreferredAgent(from: nonTmuxInHost),
-               let convId = resolveConversationId(for: chosen) {
+            if let (chosen, convId) = pickPreferredNonTmuxAgent(from: nonTmuxInHost) {
+                let hasTmuxAgents = agents.contains { $0.tmuxSocket != nil }
+                if !hasTmuxAgents || hasObservedTmuxSnapshot {
+                    lastCLIFocusKindByHost[hostPid] = .nonTmux
+                }
                 recordLiveAgentLink(agent: chosen, conversationId: convId, paneIdOverride: nil)
                 return (transcriptPath(for: convId), convId)
             }
@@ -961,19 +1038,76 @@ final class TranscriptMonitor {
 
         let chosenPair: (snapshot: TmuxServerSnapshot, client: TmuxClientInfo)?
         if let hostPid = focusHostPid {
+            let nonTmuxInHost = currentAgents.filter {
+                $0.tmuxSocket == nil && $0.hostPids.contains(hostPid)
+            }
             let hostMatches = allClients.filter {
                 AgentProcessScanner.hostAppPid(of: $0.client.clientPid) == hostPid
             }
-            if !hostMatches.isEmpty {
-                chosenPair = bestTmuxClient(from: hostMatches)
-            } else {
-                let hasNonTmuxInFrontHost = currentAgents.contains {
-                    $0.tmuxSocket == nil && $0.hostPids.contains(hostPid)
-                }
-                if hasNonTmuxInFrontHost {
+            if hostMatches.isEmpty {
+                if !nonTmuxInHost.isEmpty {
                     return nil
                 }
                 chosenPair = bestTmuxClient(from: allClients)
+            } else if nonTmuxInHost.isEmpty {
+                chosenPair = bestTmuxClient(from: hostMatches)
+            } else {
+                // This terminal app hosts BOTH tmux clients and normal (non-tmux) `agy` sessions.
+                let focusedHostMatches = hostMatches.filter { $0.client.isFocused }
+                if let focusedClient = bestTmuxClient(from: focusedHostMatches) {
+                    if tmuxFocusEventsAreReliable(for: hostPid, snapshot: focusedClient.snapshot) {
+                        chosenPair = focusedClient
+                    } else {
+                        // When the terminal or tmux server does not report focus-out (e.g. Terminal.app
+                        // or `focus-events off`), fall back to comparing user input timestamps.
+                        let tmuxInputTime = tmuxClientInputTime(focusedClient.client)
+                        let nonTmuxInputTime = nonTmuxInHost.map { nonTmuxUserInputTime(for: $0) }.max() ?? 0
+                        if nonTmuxInputTime > tmuxInputTime + 0.5 {
+                            return nil
+                        }
+                        if lastCLIFocusKindByHost[hostPid] == .nonTmux,
+                           tmuxInputTime <= nonTmuxInputTime + 0.5 {
+                            return nil
+                        }
+                        chosenPair = focusedClient
+                    }
+                } else {
+                    // None of this terminal app's tmux clients are currently focused.
+                    if isFocusHostFrontmost {
+                        if lastCLIFocusKindByHost[hostPid] == .tmux {
+                            // Brief grace window on app activation so the terminal has time to
+                            // deliver FocusIn (`\e[I`) to tmux without flickering to another tab.
+                            let now = Date()
+                            let inGraceWindow = now.timeIntervalSince(hostActivatedAt) < 0.28
+                                && tmuxFocusMonitor.lastPollStartedAt < hostActivatedAt.addingTimeInterval(0.08)
+                            if inGraceWindow {
+                                pendingPostActivationRecheck = true
+                                chosenPair = bestTmuxClient(from: hostMatches)
+                            } else {
+                                return nil
+                            }
+                        } else {
+                            return nil
+                        }
+                    } else {
+                        // Host terminal lost OS focus (e.g. user switched to Chrome with Always-on-Top):
+                        // keep whichever mode (tmux vs normal terminal) was active before blur.
+                        switch lastCLIFocusKindByHost[hostPid] {
+                        case .nonTmux:
+                            return nil
+                        case .tmux:
+                            chosenPair = bestTmuxClient(from: hostMatches)
+                        case nil:
+                            let fallbackClient = bestTmuxClient(from: hostMatches)
+                            let tmuxInputTime = fallbackClient.map { tmuxClientInputTime($0.client) } ?? 0
+                            let nonTmuxInputTime = nonTmuxInHost.map { nonTmuxUserInputTime(for: $0) }.max() ?? 0
+                            if nonTmuxInputTime > tmuxInputTime + 0.5 {
+                                return nil
+                            }
+                            chosenPair = fallbackClient
+                        }
+                    }
+                }
             }
         } else {
             chosenPair = bestTmuxClient(from: allClients)
@@ -1084,6 +1218,66 @@ final class TranscriptMonitor {
             }
             if lhs.pane.isActive != rhs.pane.isActive {
                 return !lhs.pane.isActive && rhs.pane.isActive
+            }
+            return lhs.agent.pid < rhs.agent.pid
+        }
+    }
+
+    private func tmuxFocusEventsAreReliable(for hostPid: pid_t, snapshot: TmuxServerSnapshot) -> Bool {
+        if hostsWithObservedTmuxBlur.contains(hostPid) {
+            return true
+        }
+        guard snapshot.focusEventsEnabled else { return false }
+        if let bundleId = NSRunningApplication(processIdentifier: hostPid)?.bundleIdentifier,
+           bundleId == "com.apple.Terminal" {
+            return false
+        }
+        return true
+    }
+
+    private func tmuxClientInputTime(_ client: TmuxClientInfo) -> TimeInterval {
+        max(
+            Double(client.activity),
+            AgentProcessScanner.ttyInputTime(of: client.clientPid) ?? 0,
+            lastTmuxFocusChangedAt.timeIntervalSince1970
+        )
+    }
+
+    private func nonTmuxUserInputTime(for agent: AgentProcessScanner.CLIAgent) -> TimeInterval {
+        let ttyTime = AgentProcessScanner.ttyInputTime(ofPath: agent.ttyPath) ?? 0
+        let sessionStart = sessionStartAtByAgentPid[agent.pid]?.timeIntervalSince1970 ?? 0
+        return max(ttyTime, sessionStart)
+    }
+
+    /// Selects among normal (non-tmux) `agy` sessions in the frontmost terminal app.
+    /// Ranks explicit user input (TTY input atime / SessionStart) first so switching tabs
+    /// and typing switches immediately, while keeping background output from hijacking.
+    private func pickPreferredNonTmuxAgent(
+        from agents: [AgentProcessScanner.CLIAgent]
+    ) -> (agent: AgentProcessScanner.CLIAgent, conversationId: String)? {
+        let resolved: [(agent: AgentProcessScanner.CLIAgent, conversationId: String)] = agents.compactMap { agent in
+            guard let convId = resolveConversationId(for: agent) else { return nil }
+            return (agent, convId)
+        }
+        guard !resolved.isEmpty else { return nil }
+        if resolved.count == 1 { return resolved[0] }
+        return resolved.max { lhs, rhs in
+            let lInput = nonTmuxUserInputTime(for: lhs.agent)
+            let rInput = nonTmuxUserInputTime(for: rhs.agent)
+            if abs(lInput - rInput) > 0.01 {
+                return lInput < rInput
+            }
+            let lCurrent = (lhs.conversationId == activeConversationId) ? 1 : 0
+            let rCurrent = (rhs.conversationId == activeConversationId) ? 1 : 0
+            if lCurrent != rCurrent {
+                return lCurrent < rCurrent
+            }
+            let lHook = convByAgentPid[lhs.agent.pid]?.updatedAt.timeIntervalSince1970 ?? 0
+            let rHook = convByAgentPid[rhs.agent.pid]?.updatedAt.timeIntervalSince1970 ?? 0
+            let lMtime = max(lHook, transcriptMtime(for: lhs.conversationId))
+            let rMtime = max(rHook, transcriptMtime(for: rhs.conversationId))
+            if lMtime != rMtime {
+                return lMtime < rMtime
             }
             return lhs.agent.pid < rhs.agent.pid
         }
